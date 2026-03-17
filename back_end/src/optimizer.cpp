@@ -1,15 +1,93 @@
 #include "back_end/optimizer.h"
 
+#include "TrajectoryOptComponents/LinearTimeCost.hpp"
+
+namespace
+{
+struct ZeroIntegralCost
+{
+    template <typename VecType>
+    double operator()(double /*t*/, double /*t_global*/, int /*seg_idx*/,
+                      const VecType & /*p*/, const VecType & /*v*/,
+                      const VecType & /*a*/, const VecType & /*j*/, const VecType & /*s*/,
+                      VecType & /*gp*/, VecType & /*gv*/, VecType & /*ga*/,
+                      VecType & /*gj*/, VecType & /*gs*/, double & /*gt*/) const
+    {
+        return 0.0;
+    }
+};
+
+inline void positiveSmoothedL1(const double &x,
+                               const double smooth_eps,
+                               double &f,
+                               double &df)
+{
+    const double half = 0.5 * smooth_eps;
+    const double f3c = 1.0 / (smooth_eps * smooth_eps);
+    const double f4c = -0.5 * f3c / smooth_eps;
+    const double d2c = 3.0 * f3c;
+    const double d3c = 4.0 * f4c;
+
+    if (x < smooth_eps)
+    {
+        f = (f4c * x + f3c) * x * x * x;
+        df = (d3c * x + d2c) * x * x;
+    }
+    else
+    {
+        f = x - half;
+        df = 1.0;
+    }
+}
+
+template <typename SplineType>
+void mergeSplineGradients(const typename SplineType::Gradients &src,
+                          typename SplineType::Gradients &dst)
+{
+    dst.times += src.times;
+    if (dst.inner_points.rows() == 0)
+    {
+        dst.inner_points = src.inner_points;
+    }
+    else if (src.inner_points.rows() > 0)
+    {
+        dst.inner_points += src.inner_points;
+    }
+
+    dst.start.p += src.start.p;
+    dst.start.v += src.start.v;
+    if constexpr (SplineType::ORDER >= 5)
+    {
+        dst.start.a += src.start.a;
+    }
+    if constexpr (SplineType::ORDER >= 7)
+    {
+        dst.start.j += src.start.j;
+    }
+
+    dst.end.p += src.end.p;
+    dst.end.v += src.end.v;
+    if constexpr (SplineType::ORDER >= 5)
+    {
+        dst.end.a += src.end.a;
+    }
+    if constexpr (SplineType::ORDER >= 7)
+    {
+        dst.end.j += src.end.j;
+    }
+}
+} // namespace
+
 MSPlanner::MSPlanner(const Config &conf, ros::NodeHandle &nh, std::shared_ptr<SDFmap> map):config_(conf){
     nh_ = nh;
     map_ = map;
-    mincoinitPath = nh_.advertise<nav_msgs::Path>("/visualizer/mincoinitPath",10);
-    pathmincoinitPath = nh_.advertise<nav_msgs::Path>("/visualizer/pathmincoinitPath",10);
+    initTrajPathPub_ = nh_.advertise<nav_msgs::Path>("/visualizer/traj_init_path",10);
+    preprocessedTrajPathPub_ = nh_.advertise<nav_msgs::Path>("/visualizer/traj_preprocessed_path",10);
     CollisionpointPub = nh_.advertise<sensor_msgs::PointCloud2>("/visualizer/CollisionpointPub",10);
-    processmincoinitPath = nh_.advertise<nav_msgs::Path>("/visualizer/mincoPath",10);
+    optimizedTrajPathPub_ = nh_.advertise<nav_msgs::Path>("/visualizer/traj_optimized_path",10);
 
-    mincoinitPoint = nh_.advertise<visualization_msgs::Marker>("/visualizer/mincoinitPoint",10);
-    pathmincoinitPoint = nh_.advertise<visualization_msgs::Marker>("/visualizer/pathmincoinitPoint",10);
+    initTrajPointPub_ = nh_.advertise<visualization_msgs::Marker>("/visualizer/traj_init_point",10);
+    preprocessedTrajPointPub_ = nh_.advertise<visualization_msgs::Marker>("/visualizer/traj_preprocessed_point",10);
     innerinitpositionsPoint = nh_.advertise<visualization_msgs::Marker>("/visualizer/innerinitpositionsPoint",10);
 
     recordTextPub = nh_.advertise<visualization_msgs::Marker>("/planner/calculator_time",10);
@@ -158,11 +236,18 @@ MSPlanner::MSPlanner(const Config &conf, ros::NodeHandle &nh, std::shared_ptr<SD
     readParam(ros::this_node::getName() + "/ICR_xv", ICR_.z());
 
     readParam(ros::this_node::getName() + "/if_standard_diff", if_standard_diff_);
+
+    formal_cost_adapter_.reset(this);
+    path_cost_adapter_.reset(this);
+    spline_optimizer_.setAuxiliaryStateMap(&final_state_aux_map_);
+    spline_optimizer_.setOptimizationFlags(SplineTrajectory::OptimizationFlags());
+    spline_optimizer_.setEnergyWeights(0.0);
+    spline_optimizer_.setIntegralNumSteps(1);
 }
 
-bool MSPlanner::minco_plan(const FlatTrajData &flat_traj){
+bool MSPlanner::spline_plan(const FlatTrajData &flat_traj){
 
-    ros::Time minco_start = ros::Time::now();
+    ros::Time spline_start = ros::Time::now();
     ros::Time current = ros::Time::now();
     bool final_collision = false;
     int replan_num_for_coll = 0;
@@ -178,11 +263,10 @@ bool MSPlanner::minco_plan(const FlatTrajData &flat_traj){
             return false;
         current = ros::Time::now();
         if(optimizer())
-            ROS_INFO("\033[41;37m minco optimizer time:%f \033[0m", (ros::Time::now()-current).toSec());
+            ROS_INFO("\033[41;37m spline optimizer time:%f \033[0m", (ros::Time::now()-current).toSec());
         else
             return false;
 
-        Minco.getTrajectory(optimizer_traj_);
         final_collision = check_final_collision(optimizer_traj_, iniStateXYTheta);
         if(final_collision){
             penaltyWt.time_weight *= 0.75;
@@ -207,7 +291,7 @@ bool MSPlanner::minco_plan(const FlatTrajData &flat_traj){
 
     ROS_INFO("-------------------------------------------------------------------------------------------------------------------------------");
     
-    ROS_INFO("\033[41;37m all of back_end time:%f, with optimizer %d times. \033[0m", (ros::Time::now()-minco_start).toSec(), replan_num_for_coll+1);
+    ROS_INFO("\033[41;37m all of back_end time:%f, with optimizer %d times. \033[0m", (ros::Time::now()-spline_start).toSec(), replan_num_for_coll+1);
 
     return true;
 }
@@ -234,6 +318,8 @@ bool MSPlanner::get_state(const FlatTrajData &flat_traj){
     iniStateXYTheta = flat_traj.start_state_XYTheta;
     finStateXYTheta = flat_traj.final_state_XYTheta;
 
+    updateSplineReferenceState();
+
     pub_inner_init_positions(inner_init_positions);
     
     return true;
@@ -251,30 +337,18 @@ bool MSPlanner::optimizer(){
     }
 
 
-    // 2*(N-1) intermediate points, 1 relaxed S, N times
-    int variable_num_ = 3 * TrajNum - 1;
-    // ROS_INFO_STREAM("iniStates: \n" << iniState);
-    // ROS_INFO_STREAM("finStates: \n" << finState);
-    // ROS_INFO("TrajNum: %d", TrajNum);
-    Minco.setConditions(iniState, finState, TrajNum, energyWeights);
+    updateSplineReferenceState();
+    if (!spline_optimizer_.isValid())
+    {
+        ROS_ERROR_STREAM("Invalid spline optimizer state: " << spline_optimizer_.getLastError());
+        return false;
+    }
 
-    // ROS_INFO_STREAM("init Innerpoints: \n" << Innerpoints);
-    // ROS_INFO_STREAM("init pieceTime: " << pieceTime.transpose());
+    init_final_traj_.setTraj(iniStateXYTheta, iniState, finState, Innerpoints, pieceTime);
+    trajectoryPathPub(init_final_traj_, iniStateXYTheta, initTrajPathPub_); 
+    trajectoryPointPub(init_final_traj_, iniStateXYTheta, initTrajPointPub_, Eigen::Vector3d(173, 127, 168));
 
-    Minco.setParameters(Innerpoints, pieceTime);   
-    Minco.getTrajectory(init_final_traj_);
-    mincoPathPub(init_final_traj_, iniStateXYTheta, mincoinitPath); 
-    mincoPointPub(init_final_traj_, iniStateXYTheta, mincoinitPoint, Eigen::Vector3d(173, 127, 168));
-    Eigen::VectorXd x;
-    x.resize(variable_num_);
-    int offset = 0;
-    memcpy(x.data()+offset,Innerpoints.data(), Innerpoints.size() * sizeof(x[0]));
-    offset += Innerpoints.size();
-    x[offset] = finState(1,0);
-    ++offset;
-    Eigen::Map<Eigen::VectorXd> Vt(x.data()+offset, pieceTime.size());
-    offset += pieceTime.size();
-    RealT2VirtualT(pieceTime,Vt);
+    Eigen::VectorXd x = spline_optimizer_.generateInitialGuess();
 
     double cost;
     int result;
@@ -334,21 +408,9 @@ bool MSPlanner::optimizer(){
 
     ROS_INFO_STREAM("Pre-processing optimizer:" << duration / 1000.0 << " ms");
     ROS_INFO("Pre-processing finish! result:%d   finalcost:%f   iter_num_:%d", result, cost, iter_num_);
-    offset = 0;
-    Eigen::Map<Eigen::MatrixXd> PathP(x.data() + offset, 2, TrajNum - 1);
-    offset += 2 * (TrajNum - 1);
-    finalInnerpoints = PathP;
-    finState(1, 0) = x[offset];
-    ++offset;
-
-    Eigen::Map<const Eigen::VectorXd> Patht(x.data() + offset, TrajNum);
-    offset += TrajNum;
-    VirtualT2RealT(Patht, finalpieceTime);
-    Minco.setTConditions(finState);
-    Minco.setParameters(finalInnerpoints, finalpieceTime);
-    Minco.getTrajectory(final_traj_);
-    mincoPathPub(final_traj_, iniStateXYTheta, pathmincoinitPath);
-    mincoPointPub(final_traj_, iniStateXYTheta, pathmincoinitPoint, Eigen::Vector3d(114, 159, 207));
+    updateTrajectoryFromDecision(x, init_final_traj_, finalInnerpoints, finalpieceTime, finState);
+    trajectoryPathPub(init_final_traj_, iniStateXYTheta, preprocessedTrajPathPub_);
+    trajectoryPointPub(init_final_traj_, iniStateXYTheta, preprocessedTrajPointPub_, Eigen::Vector3d(114, 159, 207));
 
     // ROS_INFO_STREAM("Path final pieces time: " << finalpieceTime.transpose());
     // ROS_INFO_STREAM("Path final Innerpoints: \n" << finalInnerpoints);
@@ -408,13 +470,13 @@ bool MSPlanner::optimizer(){
 
     }
 
-    double mincotime = (ros::Time::now()-current).toSec();
-    ROS_INFO("\033[40;36m minco optimizer time:%f \033[0m", mincotime);
+    double spline_time = (ros::Time::now()-current).toSec();
+    ROS_INFO("\033[40;36m spline optimizer time:%f \033[0m", spline_time);
     ROS_INFO_STREAM("--------------------------------------------------------------------final------------------------------------------------------");
 
     marker.header.frame_id = "world";
     marker.header.stamp = ros::Time::now();
-    marker.ns = "minco";
+    marker.ns = "spline";
     marker.id = 0;
     marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
     marker.action = visualization_msgs::Marker::ADD;
@@ -430,7 +492,7 @@ bool MSPlanner::optimizer(){
     marker.color.r = 0.0;
     marker.color.g = 0.0;
     marker.color.b = 0.0;
-    search_time = mincotime*1000.0;
+    search_time = spline_time*1000.0;
     std::ostringstream out2;
     out2 << std::fixed <<"Optimization: \n"<< std::setprecision(2) << search_time << " ms";
     marker.text = out2.str();
@@ -440,19 +502,7 @@ bool MSPlanner::optimizer(){
     // ifprint = true;
     // costFunctionCallback(this,x,g);
     
-    offset = 0;
-    Eigen::Map<Eigen::MatrixXd> P(x.data()+offset, 2, TrajNum - 1);
-    offset += 2 * (TrajNum - 1);
-    finalInnerpoints = P;
-
-    finState(1,0) = x[offset];
-    ++offset;
-
-    Eigen::Map<const Eigen::VectorXd> t(x.data()+offset, TrajNum);
-    offset += TrajNum;
-    VirtualT2RealT(t,finalpieceTime);
-    Minco.setTConditions(finState);
-    Minco.setParameters(finalInnerpoints, finalpieceTime);
+    updateTrajectoryFromDecision(x, optimizer_traj_, finalInnerpoints, finalpieceTime, finState);
 
     // std::cout<<"finalInnerpoints: \n"<<finalInnerpoints<<std::endl;
     // std::cout<<"finalpieceTime: \n"<<finalpieceTime.transpose()<<std::endl;
@@ -462,7 +512,7 @@ bool MSPlanner::optimizer(){
     return true;
 }
 
-bool MSPlanner::check_final_collision(const Trajectory<5, 2> &final_traj, const Eigen::Vector3d &start_state_XYTheta){
+bool MSPlanner::check_final_collision(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta){
     double ini_x = start_state_XYTheta.x();
     double ini_y = start_state_XYTheta.y();
 
@@ -561,26 +611,6 @@ bool MSPlanner::check_final_collision(const Trajectory<5, 2> &final_traj, const 
     return false;
 }
 
-template <typename EIGENVEC>
-inline void MSPlanner::RealT2VirtualT(const Eigen::VectorXd &RT, EIGENVEC &VT){
-    const int sizeT = RT.size();
-    VT.resize(sizeT);
-    for (int i = 0; i < sizeT; ++i){
-        VT(i) = RT(i) > 1.0 ? (sqrt(2.0 * RT(i) - 1.0) - 1.0)
-                            : (1.0 - sqrt(2.0 / RT(i) - 1.0));
-    }
-}
-
-template <typename EIGENVEC>
-inline void MSPlanner::VirtualT2RealT(const EIGENVEC &VT, Eigen::VectorXd &RT){
-    const int sizeTau = VT.size();
-    RT.resize(sizeTau);
-    for (int i = 0; i < sizeTau; ++i){
-      RT(i) = VT(i) > 0.0 ? ((0.5 * VT(i) + 1.0) * VT(i) + 1.0)
-                          : 1.0 / ((0.5 * VT(i) - 1.0) * VT(i) + 1.0);
-    }
-}
-
 inline int MSPlanner::earlyExit(void *instance,
                             const Eigen::VectorXd &x,
                             const Eigen::VectorXd &g,
@@ -598,21 +628,8 @@ inline int MSPlanner::earlyExit(void *instance,
         ROS_INFO_STREAM("x: " << x.transpose());
         ROS_INFO_STREAM("g: " << g.transpose());
         ROS_INFO_STREAM("");
-        int offset = 0;
-        Eigen::Map<const Eigen::MatrixXd> P(x.data()+offset, 2, obj.TrajNum - 1);
-        offset += 2 * (obj.TrajNum - 1);
-        obj.finalInnerpoints = P;
-
-        obj.finState(1,0) = x[offset];
-        ++offset;
-
-        Eigen::Map<const Eigen::VectorXd> t(x.data()+offset, obj.TrajNum);
-        offset += obj.TrajNum;
-        obj.VirtualT2RealT(t,obj.finalpieceTime);
-        obj.Minco.setTConditions(obj.finState);
-        obj.Minco.setParameters(obj.finalInnerpoints, obj.finalpieceTime);
-        obj.Minco.getTrajectory(obj.optimizer_traj_);
-        obj.mincoPathPub(obj.optimizer_traj_, obj.iniStateXYTheta, obj.processmincoinitPath);
+        obj.updateTrajectoryFromDecision(x, obj.optimizer_traj_, obj.finalInnerpoints, obj.finalpieceTime, obj.finState);
+        obj.trajectoryPathPub(obj.optimizer_traj_, obj.iniStateXYTheta, obj.optimizedTrajPathPub_);
         ros::Duration(0.5).sleep();
     }
     return 0;
@@ -629,71 +646,36 @@ double MSPlanner::costFunctionCallback(void *ptr,
     MSPlanner &obj = *(MSPlanner *)ptr;
     obj.iter_num_ += 1;
 
-    g.setZero();
-    // Map the input variables to the variable matrix
-    int offset = 0;
-    Eigen::Map<const Eigen::MatrixXd> P(x.data()+offset, 2, obj.TrajNum - 1);
-    Eigen::Map<Eigen::MatrixXd> gradP(g.data()+offset, 2, obj.TrajNum - 1);
-    offset += 2 * (obj.TrajNum - 1);
+    traj_opt_components::LinearTimeCost time_cost;
+    time_cost.weight = obj.penaltyWt.time_weight;
 
-    double* gradTailS = g.data()+offset;
-    obj.finState(1,0) = x[offset];
-    ++offset;
-    
-    gradP.setZero();
-    obj.Innerpoints = P;
-    
-    Eigen::Map<const Eigen::VectorXd> t(x.data()+offset, obj.TrajNum);
-    Eigen::Map<Eigen::VectorXd> gradt(g.data()+offset, obj.TrajNum);
-
-    offset += obj.TrajNum;
-    obj.VirtualT2RealT(t, obj.pieceTime);
-    gradt.setZero();
-
-    double cost;
-    obj.Minco.setTConditions(obj.finState);
-    obj.Minco.setParameters(obj.Innerpoints,obj.pieceTime);
-    obj.Minco.getEnergy(cost);
-    obj.Minco.getEnergyPartialGradByCoeffs(obj.partialGradByCoeffs);
-    obj.Minco.getEnergyPartialGradByTimes(obj.partialGradByTimes);
-    if(obj.ifprint){
-        ROS_INFO("Energy cost: %f", cost);
-    }
-    obj.attachPenaltyFunctional(cost);
-    if(obj.ifprint){
-        ROS_INFO("attachPenaltyFunctional cost: %f", cost);
-    }
-    obj.Minco.propogateArcYawLenghGrad(obj.partialGradByCoeffs, obj.partialGradByTimes,
-                                        obj.gradByPoints, obj.gradByTimes, obj.gradByTailStateS);
-
-    cost += obj.penaltyWt.time_weight * obj.pieceTime.sum();
-    if(obj.ifprint){
-        ROS_INFO("T cost: %f", obj.penaltyWt.time_weight * obj.pieceTime.sum());
-    }
-    Eigen::VectorXd rhotimes;
-    rhotimes.resize(obj.gradByTimes.size());
-    obj.gradByTimes += obj.penaltyWt.time_weight * rhotimes.setOnes();
-    
-    *gradTailS = obj.gradByTailStateS.y();
-
-    gradP = obj.gradByPoints;
-    backwardGradT(t, obj.gradByTimes, gradt);
-    
+    const double cost = obj.spline_optimizer_.evaluate(x,
+                                                       g,
+                                                       time_cost,
+                                                       ZeroIntegralCost(),
+                                                       obj.formal_cost_adapter_,
+                                                       &obj.spline_workspace_);
     return cost;
 }
 
-void MSPlanner::attachPenaltyFunctional(double &cost){
+double MSPlanner::evaluateFormalTrajectoryCost(const SplineType &spline,
+                                               const std::vector<double> &times,
+                                               const typename SplineType::MatrixType & /*waypoints*/,
+                                               double /*start_time*/,
+                                               const SplineBoundaryConditions & /*bc*/,
+                                               typename SplineType::Gradients &grads){
     collision_point.clear();
     double ini_x = iniStateXYTheta.x();
     double ini_y = iniStateXYTheta.y();
+
+    pieceTime = Eigen::Map<const Eigen::VectorXd>(times.data(), static_cast<Eigen::Index>(times.size()));
 
     Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
     double s1, s2, s3, s4, s5;
     Eigen::Vector2d sigma, dsigma, ddsigma, dddsigma;
     double IntegralAlpha, Alpha, omg, omgstep;
     
-    double unoccupied_averageT;
-    unoccupied_averageT = pieceTime.mean();
+    const double unoccupied_averageT = pieceTime.mean();
     
     double cost_corrb=0, cost_v=0, cost_a=0, cost_omega = 0, cost_domega=0, cost_endp=0, cost_moment=0, cost_meanT=0, cost_centripetal_acc=0;
     
@@ -706,9 +688,8 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
     double violaOmega, violaOmegaPena, violaOmegaPenaD;
 
     Eigen::Matrix2d help_L;
-    Eigen::Vector3d gradESDF;
     Eigen::Vector2d gradESDF2d;
-    
+
 
     // Used to obtain the position of each integral point
     std::vector<Eigen::VectorXd> VecIntegralX;
@@ -738,8 +719,13 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
     Eigen::VectorXd VecCoeffChainY(TrajNum*(SamNumEachPart+1));VecCoeffChainY.setZero();
     Eigen::Vector2d CurrentPointXY(ini_x, ini_y);
 
+    Eigen::MatrixX2d partialGradByCoeffs(spline.getTrajectory().getCoefficients().rows(), 2);
+    partialGradByCoeffs.setZero();
+    Eigen::VectorXd partialGradByTimes = Eigen::VectorXd::Zero(TrajNum);
+    double cost = accumulateWeightedEnergyCost(spline, partialGradByCoeffs, partialGradByTimes);
+
     for(int i=0; i<TrajNum; i++){
-        const Eigen::Matrix<double, 6, 2> &c = Minco.getCoeffs().block<6,2>(6*i, 0);
+        const Eigen::Matrix<double, 6, 2> c = spline.getTrajectory().getCoefficients().block<6,2>(6*i, 0);
         double step = pieceTime[i] / sparseResolution_;
         double halfstep = step / 2.0;
         double CoeffIntegral = pieceTime[i] / sparseResolution_6_;
@@ -820,7 +806,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                 violaAlp = ddsigma.x()*ddsigma.x() - config_.max_domega_*config_.max_domega_;
                 
                 if(violaAcc > 0){
-                    positiveSmoothedL1(violaAcc, violaAccPena, violaAccPenaD);
+                    positiveSmoothedL1(violaAcc, smoothEps, violaAccPena, violaAccPenaD);
                     gradViolaAT = 2.0 * Alpha * ddsigma.y() * dddsigma.y();
                     gradBeta(2,1) +=  omgstep * penaltyWt.acc_weight * violaAccPenaD * 2.0 * ddsigma.y();
                     partialGradByTimes(i) += omg * penaltyWt.acc_weight * (violaAccPenaD * gradViolaAT * step + violaAccPena / sparseResolution_);
@@ -828,7 +814,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     cost_a += omgstep * penaltyWt.acc_weight * violaAccPena;
                 }
                 if(violaAlp > 0){
-                    positiveSmoothedL1(violaAlp, violaAlpPena, violaAlpPenaD);
+                    positiveSmoothedL1(violaAlp, smoothEps, violaAlpPena, violaAlpPenaD);
                     gradViolaDOT = 2.0 * Alpha * ddsigma.x() * dddsigma.x();
                     gradBeta(2,0) += omgstep * penaltyWt.domega_weight * violaAlpPenaD * 2.0 * ddsigma.x();
                     partialGradByTimes(i) += omg * penaltyWt.domega_weight * (violaAlpPenaD * gradViolaDOT * step + violaAlpPena / sparseResolution_);
@@ -840,7 +826,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     // Directly constrain velocity and angular velocity
                     violaVel = dsigma.y() * dsigma.y() - config_.max_vel_ * config_.max_vel_;
                     if(violaVel > 0){
-                        positiveSmoothedL1(violaVel, violaVelPena, violaVelPenaD);
+                        positiveSmoothedL1(violaVel, smoothEps, violaVelPena, violaVelPenaD);
                         gradViolaPt = 2.0 * Alpha * dsigma.y()
                                         * ddsigma.y();
                         gradBeta(1,1) += omgstep * penaltyWt.moment_weight * violaVelPenaD * 2.0 * dsigma.y();
@@ -850,7 +836,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     }
                     violaOmega = dsigma.x() * dsigma.x() - config_.max_omega_ * config_.max_omega_;
                     if(violaOmega > 0){
-                        positiveSmoothedL1(violaOmega, violaOmegaPena, violaOmegaPenaD);
+                        positiveSmoothedL1(violaOmega, smoothEps, violaOmegaPena, violaOmegaPenaD);
                         gradViolaPt = 2.0 * Alpha * dsigma.x()
                                         * ddsigma.x();
                         gradBeta(1,0) += omgstep * penaltyWt.moment_weight * violaOmegaPenaD * 2.0 * dsigma.x();
@@ -865,7 +851,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     for(int omg_sym = -1; omg_sym <= 1; omg_sym += 2){
                         violaMom = omg_sym * config_.max_vel_ * dsigma.x() + config_.max_omega_ * dsigma.y() - config_.max_vel_ * config_.max_omega_;
                         if(violaMom > 0){
-                            positiveSmoothedL1(violaMom, violaMomPena, violaMomPenaD);
+                            positiveSmoothedL1(violaMom, smoothEps, violaMomPena, violaMomPenaD);
                             gradViolaMt = Alpha * (omg_sym * config_.max_vel_ * ddsigma.x() + config_.max_omega_ * ddsigma.y());
                             gradBeta(1,0) += omgstep * penaltyWt.moment_weight * violaMomPenaD * omg_sym * config_.max_vel_;
                             gradBeta(1,1) += omgstep * penaltyWt.moment_weight * violaMomPenaD * config_.max_omega_;
@@ -877,7 +863,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     for(int omg_sym = -1; omg_sym <= 1; omg_sym += 2){
                         violaMom = omg_sym * -config_.min_vel_ * dsigma.x() - config_.max_omega_ * dsigma.y() + config_.min_vel_ * config_.max_omega_;
                         if(violaMom > 0){
-                            positiveSmoothedL1(violaMom, violaMomPena, violaMomPenaD);
+                            positiveSmoothedL1(violaMom, smoothEps, violaMomPena, violaMomPenaD);
                             gradViolaMt = Alpha * (omg_sym * -config_.min_vel_ * ddsigma.x() - config_.max_omega_ * ddsigma.y());
                             gradBeta(1,0) += omgstep * penaltyWt.moment_weight * violaMomPenaD * omg_sym * -config_.min_vel_;
                             gradBeta(1,1) -= omgstep * penaltyWt.moment_weight * violaMomPenaD * config_.max_omega_;
@@ -890,7 +876,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                 // Anti-skid or anti-rollover constraint
                 violaCenAcc = dsigma.x()*dsigma.x()*dsigma.y()*dsigma.y() - config_.max_centripetal_acc_*config_.max_centripetal_acc_;
                 if(violaCenAcc > 0){
-                    positiveSmoothedL1(violaCenAcc, violaCenAccPena, violaCenAccPenaD);
+                    positiveSmoothedL1(violaCenAcc, smoothEps, violaCenAccPena, violaCenAccPenaD);
                     gradViolaCAt = 2.0 * Alpha * (dsigma.x() * dsigma.y() * dsigma.y() * ddsigma.x() + dsigma.y() * dsigma.x() * dsigma.x() * ddsigma.y());
                     gradBeta(1,0) += omgstep * penaltyWt.cen_acc_weight * violaCenAccPenaD * (2 * dsigma.x() * dsigma.y() * dsigma.y());
                     gradBeta(1,1) += omgstep * penaltyWt.cen_acc_weight * violaCenAccPenaD * (2 * dsigma.x() * dsigma.x() * dsigma.y());
@@ -915,7 +901,7 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
                     violaPos = -sdf_value + safeDis;
                     if (violaPos > 0.0){
                         if_coolision = true;
-                        positiveSmoothedL1(violaPos, violaPosPena, violaPosPenaD);
+                        positiveSmoothedL1(violaPos, smoothEps, violaPosPena, violaPosPenaD);
                         all_grad2Pos -= omgstep * penaltyWt.collision_weight * violaPosPenaD * gradESDF2d;
                         help_L << -sinyaw, -cosyaw, cosyaw, -sinyaw;
                         gradViolaPt = -Alpha * dsigma.x() * gradESDF2d.transpose() * help_L * cp2D;
@@ -1047,45 +1033,102 @@ void MSPlanner::attachPenaltyFunctional(double &cost){
         partialGradByTimes(i) += (VecSingleXGradT[i].cwiseProduct(CoeffX)).sum();
         partialGradByTimes(i) += (VecSingleYGradT[i].cwiseProduct(CoeffY)).sum();
     }
+
+    typename SplineType::Gradients local_grads;
+    SplineType spline_copy = spline;
+    spline_copy.propagateGrad(partialGradByCoeffs, partialGradByTimes, local_grads);
+    mergeSplineGradients<SplineType>(local_grads, grads);
+    return cost;
 }
 
-inline void MSPlanner::positiveSmoothedL1(const double &x, double &f, double &df){
-    const double pe = smoothEps;
-    const double half = 0.5 * pe;
-    const double f3c = 1.0 / (pe * pe);
-    const double f4c = -0.5 * f3c / pe;
-    const double d2c = 3.0 * f3c;
-    const double d3c = 4.0 * f4c;
+double MSPlanner::accumulateWeightedEnergyCost(const SplineType &spline,
+                                               Eigen::MatrixX2d &partial_grad_by_coeffs,
+                                               Eigen::VectorXd &partial_grad_by_times) const
+{
+    double cost = 0.0;
+    const Eigen::RowVector2d weights = energyWeights.transpose();
+    const auto &coeffs = spline.getTrajectory().getCoefficients();
 
-    if (x < pe){
-        f = (f4c * x + f3c) * x * x * x;
-        df = (d3c * x + d2c) * x * x;
+    for (int i = 0; i < TrajNum; ++i)
+    {
+        const double T = pieceTime(i);
+        const double T2 = T * T;
+        const double T3 = T2 * T;
+        const double T4 = T3 * T;
+        const double T5 = T4 * T;
+
+        const Eigen::RowVector2d c3 = coeffs.row(i * 6 + 3);
+        const Eigen::RowVector2d c4 = coeffs.row(i * 6 + 4);
+        const Eigen::RowVector2d c5 = coeffs.row(i * 6 + 5);
+
+        cost += 36.0 * c3.cwiseProduct(weights).dot(c3) * T +
+                144.0 * c4.cwiseProduct(weights).dot(c3) * T2 +
+                192.0 * c4.cwiseProduct(weights).dot(c4) * T3 +
+                240.0 * c5.cwiseProduct(weights).dot(c3) * T3 +
+                720.0 * c5.cwiseProduct(weights).dot(c4) * T4 +
+                720.0 * c5.cwiseProduct(weights).dot(c5) * T5;
+
+        partial_grad_by_coeffs.row(i * 6 + 3) +=
+            (72.0 * c3 * T + 144.0 * c4 * T2 + 240.0 * c5 * T3).cwiseProduct(weights);
+        partial_grad_by_coeffs.row(i * 6 + 4) +=
+            (144.0 * c3 * T2 + 384.0 * c4 * T3 + 720.0 * c5 * T4).cwiseProduct(weights);
+        partial_grad_by_coeffs.row(i * 6 + 5) +=
+            (240.0 * c3 * T3 + 720.0 * c4 * T4 + 1440.0 * c5 * T5).cwiseProduct(weights);
+
+        partial_grad_by_times(i) +=
+            36.0 * c3.cwiseProduct(weights).dot(c3) +
+            288.0 * c4.cwiseProduct(weights).dot(c3) * T +
+            576.0 * c4.cwiseProduct(weights).dot(c4) * T2 +
+            720.0 * c5.cwiseProduct(weights).dot(c3) * T2 +
+            2880.0 * c5.cwiseProduct(weights).dot(c4) * T3 +
+            3600.0 * c5.cwiseProduct(weights).dot(c5) * T4;
     }
-    else{
-        f = x - half;
-        df = 1.0;
-    }
-    return;
+
+    return cost;
 }
 
-template <typename EIGENVEC>
-inline void MSPlanner::backwardGradT(const Eigen::VectorXd &tau,
-                          const Eigen::VectorXd &gradT,
-                          EIGENVEC &gradTau){
-    const int sizetau = tau.size();
-    gradTau.resize(sizetau);
-    double gradrt2vt;
-    for (int i = 0; i < sizetau; i++){
-        if(tau(i)>0){
-            gradrt2vt = tau(i)+1.0;
-        }
-        else{
-            double denSqrt = (0.5*tau(i)-1.0)*tau(i)+1.0;
-            gradrt2vt = (1.0-tau(i))/(denSqrt*denSqrt);
-        }
-        gradTau(i) = gradT(i) * gradrt2vt;
+void MSPlanner::updateSplineReferenceState()
+{
+    spline_waypoints_ = TrajectoryAdapter::buildWaypoints(iniState, finState, Innerpoints);
+    spline_boundary_conditions_ = TrajectoryAdapter::buildBoundaryConditions(iniState, finState);
+    spline_optimizer_.setInitState(TrajectoryAdapter::buildSegmentTimes(pieceTime),
+                                   spline_waypoints_,
+                                   0.0,
+                                   spline_boundary_conditions_);
+}
+
+void MSPlanner::decodeDecisionVariables(const Eigen::VectorXd &x,
+                                        Eigen::MatrixXd &inner_points,
+                                        Eigen::VectorXd &piece_times_out,
+                                        Eigen::MatrixXd &final_state_out) const
+{
+    piece_times_out.resize(TrajNum);
+    const SplineTrajectory::QuadInvTimeMap time_map;
+    for (int i = 0; i < TrajNum; ++i)
+    {
+        piece_times_out(i) = time_map.toTime(x(i));
     }
-    return;
+
+    inner_points.resize(2, TrajNum - 1);
+    int offset = TrajNum;
+    for (int i = 0; i < TrajNum - 1; ++i)
+    {
+        inner_points.col(i) = x.segment<2>(offset);
+        offset += 2;
+    }
+
+    final_state_out = finState;
+    final_state_out(1, 0) = x(offset);
+}
+
+void MSPlanner::updateTrajectoryFromDecision(const Eigen::VectorXd &x,
+                                             TrajectoryAdapter &traj,
+                                             Eigen::MatrixXd &inner_points_out,
+                                             Eigen::VectorXd &piece_times_out,
+                                             Eigen::MatrixXd &final_state_out)
+{
+    decodeDecisionVariables(x, inner_points_out, piece_times_out, final_state_out);
+    traj.setTraj(iniStateXYTheta, iniState, final_state_out, inner_points_out, piece_times_out);
 }
 
 void MSPlanner::get_the_predicted_state(const double& time, Eigen::Vector3d& XYTheta, Eigen::Vector3d& VAJ, Eigen::Vector3d& OAJ){
@@ -1260,48 +1303,29 @@ double MSPlanner::costFunctionCallbackPath(void *ptr,
     }
     MSPlanner &obj = *(MSPlanner *)ptr;
     ++obj.iter_num_;
-    int offset = 0;
-    Eigen::Map<const Eigen::MatrixXd> P(x.data()+offset, 2, obj.TrajNum - 1);
-    Eigen::Map<Eigen::MatrixXd> gradP(g.data()+offset, 2, obj.TrajNum - 1);
-    offset += 2 * (obj.TrajNum - 1);
 
-    double* gradTailS = g.data()+offset;
-    obj.finState(1,0) = x[offset];
-    ++offset;
+    traj_opt_components::LinearTimeCost time_cost;
+    time_cost.weight = obj.PathpenaltyWt.time_weight;
 
-    gradP.setZero();
-    obj.Innerpoints = P;
-    Eigen::Map<const Eigen::VectorXd> t(x.data()+offset, obj.TrajNum);
-    Eigen::Map<Eigen::VectorXd> gradt(g.data()+offset, obj.TrajNum);
-    offset += obj.TrajNum;
-    obj.VirtualT2RealT(t, obj.pieceTime);
-    gradt.setZero();
-    double cost;
-    obj.Minco.setTConditions(obj.finState);
-    obj.Minco.setParameters(obj.Innerpoints,obj.pieceTime);
-    obj.Minco.getEnergy(cost);
-    obj.Minco.getEnergyPartialGradByCoeffs(obj.partialGradByCoeffs);
-    obj.Minco.getEnergyPartialGradByTimes(obj.partialGradByTimes);
-    obj.attachPenaltyFunctionalPath(cost);
-    obj.Minco.propogateArcYawLenghGrad(obj.partialGradByCoeffs, obj.partialGradByTimes,
-                                        obj.gradByPoints, obj.gradByTimes, obj.gradByTailStateS);
-
-    *gradTailS = obj.gradByTailStateS.y();
-
-    cost += obj.PathpenaltyWt.time_weight * obj.pieceTime.sum();
-
-    Eigen::VectorXd rhotimes;
-    rhotimes.resize(obj.gradByTimes.size());
-    obj.gradByTimes += obj.penaltyWt.time_weight * rhotimes.setOnes();
-    gradP = obj.gradByPoints;
-    backwardGradT(t, obj.gradByTimes, gradt);
-    
+    const double cost = obj.spline_optimizer_.evaluate(x,
+                                                       g,
+                                                       time_cost,
+                                                       ZeroIntegralCost(),
+                                                       obj.path_cost_adapter_,
+                                                       &obj.spline_workspace_);
     return cost;
 }
 
-void MSPlanner::attachPenaltyFunctionalPath(double &cost){
+double MSPlanner::evaluatePathTrajectoryCost(const SplineType &spline,
+                                             const std::vector<double> &times,
+                                             const typename SplineType::MatrixType & /*waypoints*/,
+                                             double /*start_time*/,
+                                             const SplineBoundaryConditions & /*bc*/,
+                                             typename SplineType::Gradients &grads){
     double ini_x = iniStateXYTheta.x();
     double ini_y = iniStateXYTheta.y();
+
+    pieceTime = Eigen::Map<const Eigen::VectorXd>(times.data(), static_cast<Eigen::Index>(times.size()));
 
     Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
     double s1, s2, s3, s4, s5;
@@ -1309,8 +1333,7 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
     int SamNumEachPart = 2 * sparseResolution_;
     double IntegralAlpha, omg;
 
-    double unoccupied_averageT;
-    unoccupied_averageT = pieceTime.mean();
+    const double unoccupied_averageT = pieceTime.mean();
     
     double violaPos;
 
@@ -1345,8 +1368,13 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
     Eigen::VectorXd VecCoeffChainY(TrajNum*(SamNumEachPart+1));VecCoeffChainY.setZero();
     // Eigen::Vector2d CurrentPointXY(ini_x, ini_y);
 
+    Eigen::MatrixX2d partialGradByCoeffs(spline.getTrajectory().getCoefficients().rows(), 2);
+    partialGradByCoeffs.setZero();
+    Eigen::VectorXd partialGradByTimes = Eigen::VectorXd::Zero(TrajNum);
+    double cost = accumulateWeightedEnergyCost(spline, partialGradByCoeffs, partialGradByTimes);
+
     for(int i=0; i<TrajNum; i++){
-        const Eigen::Matrix<double, 6, 2> &c = Minco.getCoeffs().block<6,2>(6*i, 0);
+        const Eigen::Matrix<double, 6, 2> c = spline.getTrajectory().getCoefficients().block<6,2>(6*i, 0);
         double step = pieceTime[i] / sparseResolution_;
         double halfstep = step / 2;
         double CoeffIntegral = pieceTime[i] / sparseResolution_ / 6;
@@ -1429,7 +1457,7 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
                 for(int omg_sym = -1; omg_sym <= 1; omg_sym += 2){
                     violaMom = omg_sym * config_.max_vel_ * dsigma.x() + config_.max_omega_ * dsigma.y() - config_.max_vel_ * config_.max_omega_;
                     if(violaMom > 0){
-                        positiveSmoothedL1(violaMom, violaMomPena, violaMomPenaD);
+                        positiveSmoothedL1(violaMom, smoothEps, violaMomPena, violaMomPenaD);
                         gradViolaMt = Alpha * (omg_sym * config_.max_vel_ * ddsigma.x() + config_.max_omega_ * ddsigma.y());
                         gradBeta(1,0) += omg * step * PathpenaltyWt.moment_weight * violaMomPenaD * omg_sym * config_.max_vel_;
                         gradBeta(1,1) += omg * step * PathpenaltyWt.moment_weight * violaMomPenaD * config_.max_omega_;
@@ -1441,7 +1469,7 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
                 for(int omg_sym = -1; omg_sym <= 1; omg_sym += 2){
                     violaMom = omg_sym * -config_.min_vel_ * dsigma.x() - config_.max_omega_ * dsigma.y() + config_.min_vel_ * config_.max_omega_;
                     if(violaMom > 0){
-                        positiveSmoothedL1(violaMom, violaMomPena, violaMomPenaD);
+                        positiveSmoothedL1(violaMom, smoothEps, violaMomPena, violaMomPenaD);
                         gradViolaMt = Alpha * (omg_sym * -config_.min_vel_ * ddsigma.x() - config_.max_omega_ * ddsigma.y());
                         gradBeta(1,0) += omg * step * PathpenaltyWt.moment_weight * violaMomPenaD * omg_sym * -config_.min_vel_;
                         gradBeta(1,1) -= omg * step * PathpenaltyWt.moment_weight * violaMomPenaD * config_.max_omega_;
@@ -1455,7 +1483,7 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
                 double violaAlp = ddsigma.x()*ddsigma.x() - config_.max_domega_*config_.max_domega_;
                 double violaAccPena, violaAccPenaD, violaAlpPena, violaAlpPenaD;
                 if(violaAcc > 0){
-                    positiveSmoothedL1(violaAcc, violaAccPena, violaAccPenaD);
+                    positiveSmoothedL1(violaAcc, smoothEps, violaAccPena, violaAccPenaD);
                     double gradViolaAT = 2.0 * Alpha * ddsigma.y() * dddsigma.y();
                     gradBeta(2,1) +=  omg * step * PathpenaltyWt.acc_weight * violaAccPenaD * 2.0 * ddsigma.y();
                     partialGradByTimes(i) += omg * PathpenaltyWt.acc_weight * (violaAccPenaD * gradViolaAT * step + violaAccPena / sparseResolution_);
@@ -1463,7 +1491,7 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
                     cost_moment += omg * step * PathpenaltyWt.acc_weight * violaAccPena;
                 }
                 if(violaAlp > 0){
-                    positiveSmoothedL1(violaAlp, violaAlpPena, violaAlpPenaD);
+                    positiveSmoothedL1(violaAlp, smoothEps, violaAlpPena, violaAlpPenaD);
                     double gradViolaDOT = 2.0 * Alpha * ddsigma.x() * dddsigma.x();
                     gradBeta(2,0) += omg * step * PathpenaltyWt.domega_weight * violaAlpPenaD * 2.0 * ddsigma.x();
                     partialGradByTimes(i) += omg * PathpenaltyWt.domega_weight * (violaAlpPenaD * gradViolaDOT * step + violaAlpPena / sparseResolution_);
@@ -1569,9 +1597,15 @@ void MSPlanner::attachPenaltyFunctionalPath(double &cost){
         partialGradByTimes(i) += (VecSingleXGradT[i].cwiseProduct(VecCoeffChainX.block(i*(SamNumEachPart+1),0,SamNumEachPart+1,1).cwiseProduct(IntegralChainCoeff))).sum();
         partialGradByTimes(i) += (VecSingleYGradT[i].cwiseProduct(VecCoeffChainY.block(i*(SamNumEachPart+1),0,SamNumEachPart+1,1).cwiseProduct(IntegralChainCoeff))).sum();
     }
+
+    typename SplineType::Gradients local_grads;
+    SplineType spline_copy = spline;
+    spline_copy.propagateGrad(partialGradByCoeffs, partialGradByTimes, local_grads);
+    mergeSplineGradients<SplineType>(local_grads, grads);
+    return cost;
 }
 
-void MSPlanner::mincoPathPub(const Trajectory<5, 2> &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher){
+void MSPlanner::trajectoryPathPub(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher){
 
     double ini_x = start_state_XYTheta.x();
     double ini_y = start_state_XYTheta.y();
@@ -1676,7 +1710,7 @@ void MSPlanner::mincoPathPub(const Trajectory<5, 2> &final_traj, const Eigen::Ve
     // outFile2.close();
 }
 
-void MSPlanner::mincoPointPub(const Trajectory<5,2> &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher, const Eigen::Vector3d &color){
+void MSPlanner::trajectoryPointPub(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher, const Eigen::Vector3d &color){
     double ini_x = start_state_XYTheta.x();
     double ini_y = start_state_XYTheta.y();
 

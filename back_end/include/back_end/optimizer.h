@@ -23,9 +23,21 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include "gcopter/trajectory.hpp"
-#include "gcopter/minco.hpp"
 #include "gcopter/lbfgs.hpp"
+#include "traj_opt/spline/SplineOptimizer.hpp"
+#include "TrajectoryOptAdapters/DdrFinalStateAuxiliaryStateMap.hpp"
+#include "TrajectoryOptAdapters/DdrFormalPenaltyCostAdapter.hpp"
+#include "TrajectoryOptAdapters/DdrPathPenaltyCostAdapter.hpp"
+#include "TrajectoryOptAdapters/DdrSplineTrajectoryAdapter.hpp"
+
+namespace traj_opt_adapters
+{
+template <typename PlannerT>
+struct DdrFormalPenaltyCostAdapter;
+
+template <typename PlannerT>
+struct DdrPathPenaltyCostAdapter;
+} // namespace traj_opt_adapters
 
 
 struct Config
@@ -85,17 +97,23 @@ struct PathLbfgsParams{
 class MSPlanner
 {
 private:
+    template <typename PlannerT>
+    friend struct traj_opt_adapters::DdrFormalPenaltyCostAdapter;
+
+    template <typename PlannerT>
+    friend struct traj_opt_adapters::DdrPathPenaltyCostAdapter;
+
     Config config_;
     ros::NodeHandle nh_;
     std::shared_ptr<SDFmap> map_;
     
-    ros::Publisher mincoinitPath;
-    ros::Publisher pathmincoinitPath;
+    ros::Publisher initTrajPathPub_;
+    ros::Publisher preprocessedTrajPathPub_;
     ros::Publisher CollisionpointPub;
-    ros::Publisher processmincoinitPath;
+    ros::Publisher optimizedTrajPathPub_;
 
-    ros::Publisher mincoinitPoint;
-    ros::Publisher pathmincoinitPoint;
+    ros::Publisher initTrajPointPub_;
+    ros::Publisher preprocessedTrajPointPub_;
     ros::Publisher innerinitpositionsPoint;
 
     ros::Publisher recordTextPub;
@@ -132,12 +150,30 @@ private:
     Eigen::MatrixXd finalInnerpoints;
     Eigen::VectorXd finalpieceTime;
 
-    minco::MINCO_S3NU Minco;
     std::vector<Eigen::Vector3d> statelist;
 
     PathLbfgsParams path_lbfgs_params_;
     PathpenaltyWeights PathpenaltyWt;
  
+    using TrajectoryAdapter = traj_opt_adapters::DdrSplineTrajectoryAdapter;
+    using SplineType = typename TrajectoryAdapter::SplineType;
+    using SplineBoundaryConditions = typename TrajectoryAdapter::BoundaryConditions;
+    using SplineOptimizer = SplineTrajectory::SplineOptimizer<
+        2,
+        SplineType,
+        SplineTrajectory::QuadInvTimeMap,
+        SplineTrajectory::IdentitySpatialMap<2>,
+        traj_opt_adapters::DdrFinalStateAuxiliaryStateMap>;
+
+    SplineOptimizer spline_optimizer_;
+    SplineOptimizer::Workspace spline_workspace_;
+    traj_opt_adapters::DdrFinalStateAuxiliaryStateMap final_state_aux_map_;
+    traj_opt_adapters::DdrFormalPenaltyCostAdapter<MSPlanner> formal_cost_adapter_;
+    traj_opt_adapters::DdrPathPenaltyCostAdapter<MSPlanner> path_cost_adapter_;
+
+    SplineBoundaryConditions spline_boundary_conditions_;
+    typename TrajectoryAdapter::MatrixType spline_waypoints_;
+
 
     // sampling parameters
     int sparseResolution_;
@@ -146,12 +182,6 @@ private:
     int mintrajNum_;
 
     int iter_num_;
-    // store the gradient of the cost function
-    Eigen::Matrix2Xd gradByPoints;
-    Eigen::VectorXd gradByTimes;
-    Eigen::MatrixX2d partialGradByCoeffs;
-    Eigen::VectorXd partialGradByTimes;
-    Eigen::Vector2d gradByTailStateS;
     Eigen::Vector2d FinalIntegralXYError;
     // for ALM
     Eigen::Vector2d FinalIntegralXYError_;
@@ -188,14 +218,14 @@ private:
 
     bool if_visual_optimization_ = false;
 
-public:
+ public:
 
     // Results
-    Trajectory<5, 2> final_traj_;
+    TrajectoryAdapter final_traj_;
     // Results before collision check
-    Trajectory<5, 2> optimizer_traj_;
+    TrajectoryAdapter optimizer_traj_;
     // Results before trajectory pre-processing
-    Trajectory<5, 2> init_final_traj_;
+    TrajectoryAdapter init_final_traj_;
 
     Eigen::Vector3d ICR_;
     bool if_standard_diff_;
@@ -203,19 +233,13 @@ public:
     MSPlanner(const Config &conf, ros::NodeHandle &nh, std::shared_ptr<SDFmap> map);
 
     // Main function of the optimizer
-    bool minco_plan(const FlatTrajData &flat_traj);
+    bool spline_plan(const FlatTrajData &flat_traj);
     // Obtain the initial state for planning
     bool get_state(const FlatTrajData &flat_traj);
     // Optimization
     bool optimizer();
     // Result check: whether a collision occurred
-    bool check_final_collision(const Trajectory<5, 2> &final_traj, const Eigen::Vector3d &start_state_XYTheta);
-
-    template <typename EIGENVEC>
-    inline void RealT2VirtualT(const Eigen::VectorXd &RT, EIGENVEC &VT);
-
-    template <typename EIGENVEC>
-    inline void VirtualT2RealT(const EIGENVEC &VT, Eigen::VectorXd &RT);
+    bool check_final_collision(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta);
 
     static inline int earlyExit(void *instance,
                                 const Eigen::VectorXd &x,
@@ -229,23 +253,41 @@ public:
                                        const Eigen::VectorXd &x,
                                        Eigen::VectorXd &g);
 
-    // Gradient for partialGradByCoeffs and partialGradByTimes
-    void attachPenaltyFunctional(double &cost);
-
-    inline void positiveSmoothedL1(const double &x, double &f, double &df);
-
-    template <typename EIGENVEC>
-    static inline void backwardGradT(const Eigen::VectorXd &tau,
-                                    const Eigen::VectorXd &gradT,
-                                    EIGENVEC &gradTau);
-    
     static double costFunctionCallbackPath(void *ptr,
                                            const Eigen::VectorXd &x,
                                            Eigen::VectorXd &g);
 
-    void attachPenaltyFunctionalPath(double &cost);
-    void mincoPathPub(const Trajectory<5, 2> &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher);
-    void mincoPointPub(const Trajectory<5,2> &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher, const Eigen::Vector3d &color);
+    void trajectoryPathPub(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher);
+    void trajectoryPointPub(const TrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta, const ros::Publisher &publisher, const Eigen::Vector3d &color);
+
+    double evaluateFormalTrajectoryCost(const SplineType &spline,
+                                        const std::vector<double> &times,
+                                        const typename SplineType::MatrixType &waypoints,
+                                        double start_time,
+                                        const SplineBoundaryConditions &bc,
+                                        typename SplineType::Gradients &grads);
+
+    double evaluatePathTrajectoryCost(const SplineType &spline,
+                                      const std::vector<double> &times,
+                                      const typename SplineType::MatrixType &waypoints,
+                                      double start_time,
+                                      const SplineBoundaryConditions &bc,
+                                      typename SplineType::Gradients &grads);
+
+    double accumulateWeightedEnergyCost(const SplineType &spline,
+                                        Eigen::MatrixX2d &partial_grad_by_coeffs,
+                                        Eigen::VectorXd &partial_grad_by_times) const;
+
+    void updateSplineReferenceState();
+    void decodeDecisionVariables(const Eigen::VectorXd &x,
+                                Eigen::MatrixXd &inner_points,
+                                Eigen::VectorXd &piece_times,
+                                Eigen::MatrixXd &final_state) const;
+    void updateTrajectoryFromDecision(const Eigen::VectorXd &x,
+                                      TrajectoryAdapter &traj,
+                                      Eigen::MatrixXd &inner_points,
+                                      Eigen::VectorXd &piece_times,
+                                      Eigen::MatrixXd &final_state);
 
     void Collision_point_Pub();
 

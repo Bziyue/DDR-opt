@@ -6,13 +6,12 @@
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
 
-#include "gcopter/minco.hpp"
+#include "TrajectoryOptAdapters/DdrSplineTrajectoryAdapter.hpp"
 
 class TrajAnal{
     private:
-        minco::MINCO_S3NU minco_;
         Eigen::Vector3d start_state_;
-        Trajectory<5, 2> minco_traj_;
+        traj_opt_adapters::DdrSplineTrajectoryAdapter spline_traj_;
 
         // State sequence: position (x, y, theta, t). Note: does not include the endpoint
         std::vector<Eigen::Vector4d> state_sequence_;
@@ -42,9 +41,7 @@ class TrajAnal{
                 printf("Innerpoints.cols() != pieceTimes.size()-1 !!  Innerpoints.cols(): %ld  pieceTimes.size(): %d", Innerpoints.cols(), traj_num);
                 exit(1);
             }
-            minco_.setConditions(initstate, finalstate, traj_num);
-            minco_.setParameters(Innerpoints, pieceTimes);
-            minco_.getTrajectory(minco_traj_);
+            spline_traj_.setTraj(start_state, initstate, finalstate, Innerpoints, pieceTimes);
             start_state_ = start_state;
 
             ICR_ = ICR;
@@ -63,17 +60,17 @@ class TrajAnal{
             Eigen::Vector3d current_state = start_state_;
             state_sequence_.emplace_back(current_state.x(), current_state.y(), current_state.z(), 0.0);
 
-            int sequence_num = floor(minco_traj_.getTotalDuration() / Integral_appr_res);
+            int sequence_num = floor(spline_traj_.getTotalDuration() / Integral_appr_res);
 
             Eigen::Vector2d p1, p2, p3, v1, v2, v3;
-            p3 = minco_traj_.getPos(0.0);
-            v3 = minco_traj_.getVel(0.0);
+            p3 = spline_traj_.getPos(0.0);
+            v3 = spline_traj_.getVel(0.0);
             for(int i=0; i<sequence_num; i++){
                 p1 = p3; v1 = v3;
-                p2 = minco_traj_.getPos(i * Integral_appr_res + half_Integral_appr_res);
-                v2 = minco_traj_.getVel(i * Integral_appr_res + half_Integral_appr_res);
-                p3 = minco_traj_.getPos(i * Integral_appr_res + Integral_appr_res);
-                v3 = minco_traj_.getVel(i * Integral_appr_res + Integral_appr_res);
+                p2 = spline_traj_.getPos(i * Integral_appr_res + half_Integral_appr_res);
+                v2 = spline_traj_.getVel(i * Integral_appr_res + half_Integral_appr_res);
+                p3 = spline_traj_.getPos(i * Integral_appr_res + Integral_appr_res);
+                v3 = spline_traj_.getVel(i * Integral_appr_res + Integral_appr_res);
 
                 double x1 = v1.y()*cos(p1.x()) + v1.x() * ICR_.z() * sin(p1.x());
                 double x2 = v2.y()*cos(p2.x()) + v2.x() * ICR_.z() * sin(p2.x());
@@ -99,7 +96,7 @@ class TrajAnal{
         }
 
         double get_traj_duration(){
-            return minco_traj_.getTotalDuration();
+            return spline_traj_.getTotalDuration();
         }
 
         Eigen::Vector3d getPstate(const double& t){
@@ -108,12 +105,12 @@ class TrajAnal{
             double diff_t = t - floor_t;
             Eigen::Vector4d state = state_sequence_[index];
             Eigen::Vector2d p1, p2, p3, v1, v2, v3;
-            p1 = minco_traj_.getPos(floor_t);
-            v1 = minco_traj_.getVel(floor_t);
-            p2 = minco_traj_.getPos(floor_t + diff_t/2.0);
-            v2 = minco_traj_.getVel(floor_t + diff_t/2.0);
-            p3 = minco_traj_.getPos(t);
-            v3 = minco_traj_.getVel(t);
+            p1 = spline_traj_.getPos(floor_t);
+            v1 = spline_traj_.getVel(floor_t);
+            p2 = spline_traj_.getPos(floor_t + diff_t/2.0);
+            v2 = spline_traj_.getVel(floor_t + diff_t/2.0);
+            p3 = spline_traj_.getPos(t);
+            v3 = spline_traj_.getVel(t);
 
             double x1 = v1.y()*cos(p1.x()) + v1.x() * ICR_.z() * sin(p1.x());
             double x2 = v2.y()*cos(p2.x()) + v2.x() * ICR_.z() * sin(p2.x());
@@ -130,11 +127,11 @@ class TrajAnal{
         }
 
         Eigen::Vector2d getVstate(const double& t){
-            return minco_traj_.getVel(t);
+            return spline_traj_.getVel(t);
         }
 
         Eigen::Vector2d getAstate(const double& t){
-            return minco_traj_.getAcc(t);
+            return spline_traj_.getAcc(t);
         }
 };
 

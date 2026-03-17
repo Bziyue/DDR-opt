@@ -24,7 +24,7 @@
 #include "nav_msgs/Path.h"
 #include "tf/transform_datatypes.h"
 
-#include "gcopter/trajectory.hpp"
+#include "TrajectoryOptAdapters/DdrSplineTrajectoryAdapter.hpp"
 
 // debug
 #include <fstream>
@@ -41,15 +41,15 @@ class Visualizer
     ros::Publisher edgePub;
     
   public:
-    ros::Publisher mincoPathPath;
-    ros::Publisher mincoPointMarker;
+    ros::Publisher trajPathPub_;
+    ros::Publisher trajPointMarker_;
     Visualizer(ros::NodeHandle nh){
       nh_ = nh;
       kinoastarPubPCL = nh_.advertise<sensor_msgs::PointCloud2>("/visualizer/kinoastarPathPCL",10);
       kinoastarPubPath = nh_.advertise<nav_msgs::Path>("/visualizer/kinoastarPath",10);
       finalnodePubMarker = nh_.advertise<visualization_msgs::Marker>("/visualizer/finalnode",10);
-      mincoPathPath = nh_.advertise<nav_msgs::Path>("/visualizer/mincoPath",10);
-      mincoPointMarker = nh_.advertise<visualization_msgs::Marker>("/visualizer/mincoPoint",10);
+      trajPathPub_ = nh_.advertise<nav_msgs::Path>("/visualizer/traj_path",10);
+      trajPointMarker_ = nh_.advertise<visualization_msgs::Marker>("/visualizer/traj_point",10);
 
       
     }
@@ -146,7 +146,7 @@ class Visualizer
       finalnodePubMarker.publish(marker);
     }
 
-    void mincoPathPub(const Trajectory<5, 2> &final_traj, const Eigen::Vector3d &start_state_XYTheta){
+    void trajectoryPathPub(const traj_opt_adapters::DdrSplineTrajectoryAdapter &final_traj, const Eigen::Vector3d &start_state_XYTheta){
       double ini_x = start_state_XYTheta.x();
       double ini_y = start_state_XYTheta.y();
 
@@ -221,7 +221,7 @@ class Visualizer
           path.poses.push_back(pose);
         }
       }
-      mincoPathPath.publish(path);
+      trajPathPub_.publish(path);
       ROS_INFO("\033[40;33m iter real finStateXY:%f  %f  \033[0m", pos.x(), pos.y());
     }
 

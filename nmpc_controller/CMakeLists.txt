@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.0.2)
 project(nmpc_controller)
 
 set(CMAKE_BUILD_TYPE "Release")
-ADD_COMPILE_OPTIONS(-std=c++14 )
+ADD_COMPILE_OPTIONS(-std=c++17 )
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

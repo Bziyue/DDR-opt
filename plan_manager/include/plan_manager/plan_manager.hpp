@@ -250,7 +250,7 @@ class PlanManager
         ROS_INFO("\033[41;37m all of front end time:%f \033[0m", (ros::Time::now()-astar_start_time).toSec());
 
         // optimizer
-        bool result = msplanner_->minco_plan(jps_planner_->flat_traj_);
+        bool result = msplanner_->spline_plan(jps_planner_->flat_traj_);
         if(!result){
           return;
         }
@@ -258,8 +258,8 @@ class PlanManager
         ROS_INFO("\033[43;32m all of plan time:%f \033[0m", (ros::Time::now().toSec()-current));
 
         // visualization
-        msplanner_->mincoPathPub(msplanner_->final_traj_, plan_start_state_XYTheta, visualizer_->mincoPathPath);
-        msplanner_->mincoPointPub(msplanner_->final_traj_, plan_start_state_XYTheta, visualizer_->mincoPointMarker, Eigen::Vector3d(239, 41, 41));
+        msplanner_->trajectoryPathPub(msplanner_->final_traj_, plan_start_state_XYTheta, visualizer_->trajPathPub_);
+        msplanner_->trajectoryPointPub(msplanner_->final_traj_, plan_start_state_XYTheta, visualizer_->trajPointMarker_, Eigen::Vector3d(239, 41, 41));
         
         // for replan
         if(plan_start_time_ < 0){
