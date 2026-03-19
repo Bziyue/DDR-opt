@@ -5,6 +5,10 @@ set(CMAKE_BUILD_TYPE "Release")
 ADD_COMPILE_OPTIONS(-std=c++17 )
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+get_filename_component(DDR_OPT_REPO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+include("${DDR_OPT_REPO_DIR}/cmake/UseBundledOsqp.cmake")
 
 find_package(catkin REQUIRED COMPONENTS
   carstatemsgs
@@ -15,11 +19,25 @@ find_package(catkin REQUIRED COMPONENTS
   back_end
 )
 
-find_package(OsqpEigen REQUIRED)
+find_package(OsqpEigen QUIET)
 find_package(cmake_modules REQUIRED)
 find_package(PCL REQUIRED)
+find_package(Eigen3 REQUIRED)
 
-include_directories(/usr/local/include/osqp)
+if(OsqpEigen_FOUND)
+  get_filename_component(DDR_OPT_OSQP_PREFIX "${OsqpEigen_DIR}/../.." ABSOLUTE)
+else()
+  ddr_opt_use_bundled_osqp(
+    REPO_DIR "${DDR_OPT_REPO_DIR}"
+    PREFIX_VAR DDR_OPT_OSQP_PREFIX
+  )
+endif()
+
+include_directories(
+  /usr/local/include/osqp
+  "${DDR_OPT_OSQP_PREFIX}/include"
+  "${DDR_OPT_OSQP_PREFIX}/include/osqp"
+)
 
 # add_message_files(FILES
 #   Polynome.msg
@@ -40,7 +58,7 @@ catkin_package(
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
-  ${Eigen3_INCLUDE_DIRS} 
+  ${Eigen3_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
 )
 
@@ -86,7 +104,7 @@ target_include_directories(nmpc PUBLIC
   include 
   ${EIGEN3_INCLUDE_DIR}
   SYSTEM
-  ${catkin_INCLUDE_DIRS} 
+  ${catkin_INCLUDE_DIRS}
   # MPC solver
   UAV_CAR_model/build/quadrotor_mpc_codegen
   externals/qpoases
@@ -95,11 +113,17 @@ target_include_directories(nmpc PUBLIC
   ${CERES_INCLUDE_DIRS}
 )
 
+if(EXISTS "${DDR_OPT_OSQP_PREFIX}/lib")
+  set_target_properties(nmpc PROPERTIES
+    BUILD_RPATH "${DDR_OPT_OSQP_PREFIX}/lib"
+    INSTALL_RPATH "${DDR_OPT_OSQP_PREFIX}/lib"
+  )
+endif()
+
 target_link_libraries(nmpc
   OsqpEigen::OsqpEigen
   ${catkin_LIBRARIES}
-  libosqp.so  
-  libOsqpEigen.so 
+  ${PCL_LIBRARIES}
+  Eigen3::Eigen
   ${CERES_LIBRARIES}
-  # libqdldl.so 
 )
