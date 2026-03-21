@@ -7,7 +7,7 @@ namespace
 struct ZeroIntegralCost
 {
     template <typename VecType>
-    double operator()(double /*t*/, double /*t_global*/, int /*seg_idx*/,
+    double operator()(double /*t*/, double /*t_global*/, int /*seg_idx*/, int /*step_in_seg*/,
                       const VecType & /*p*/, const VecType & /*v*/,
                       const VecType & /*a*/, const VecType & /*j*/, const VecType & /*s*/,
                       VecType & /*gp*/, VecType & /*gv*/, VecType & /*ga*/,
