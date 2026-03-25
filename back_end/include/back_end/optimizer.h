@@ -166,7 +166,8 @@ private:
         traj_opt_adapters::DdrFinalStateAuxiliaryStateMap>;
 
     SplineOptimizer spline_optimizer_;
-    SplineOptimizer::Workspace spline_workspace_;
+    SplineOptimizer::OptimizationContext spline_context_;
+    SplineOptimizer::OptimizerConfig spline_optimizer_config_;
     traj_opt_adapters::DdrFinalStateAuxiliaryStateMap final_state_aux_map_;
     traj_opt_adapters::DdrFormalPenaltyCostAdapter<MSPlanner> formal_cost_adapter_;
     traj_opt_adapters::DdrPathPenaltyCostAdapter<MSPlanner> path_cost_adapter_;
@@ -278,7 +279,7 @@ private:
                                         Eigen::MatrixX2d &partial_grad_by_coeffs,
                                         Eigen::VectorXd &partial_grad_by_times) const;
 
-    void updateSplineReferenceState();
+    SplineOptimizer::Status updateSplineReferenceState();
     void decodeDecisionVariables(const Eigen::VectorXd &x,
                                 Eigen::MatrixXd &inner_points,
                                 Eigen::VectorXd &piece_times,

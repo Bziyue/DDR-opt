@@ -239,10 +239,10 @@ MSPlanner::MSPlanner(const Config &conf, ros::NodeHandle &nh, std::shared_ptr<SD
 
     formal_cost_adapter_.reset(this);
     path_cost_adapter_.reset(this);
-    spline_optimizer_.setAuxiliaryStateMap(&final_state_aux_map_);
-    spline_optimizer_.setOptimizationFlags(SplineTrajectory::OptimizationFlags());
-    spline_optimizer_.setEnergyWeights(0.0);
-    spline_optimizer_.setIntegralNumSteps(1);
+    spline_optimizer_config_.auxiliary_state_map = &final_state_aux_map_;
+    spline_optimizer_config_.rho_energy = 0.0;
+    spline_optimizer_config_.integral_num_steps = 1;
+    spline_optimizer_.setConfig(spline_optimizer_config_);
 }
 
 bool MSPlanner::spline_plan(const FlatTrajData &flat_traj){
@@ -318,7 +318,9 @@ bool MSPlanner::get_state(const FlatTrajData &flat_traj){
     iniStateXYTheta = flat_traj.start_state_XYTheta;
     finStateXYTheta = flat_traj.final_state_XYTheta;
 
-    updateSplineReferenceState();
+    if (!updateSplineReferenceState()) {
+        return false;
+    }
 
     pub_inner_init_positions(inner_init_positions);
     
@@ -337,10 +339,10 @@ bool MSPlanner::optimizer(){
     }
 
 
-    updateSplineReferenceState();
-    if (!spline_optimizer_.isValid())
+    const auto spline_status = updateSplineReferenceState();
+    if (!spline_status)
     {
-        ROS_ERROR_STREAM("Invalid spline optimizer state: " << spline_optimizer_.getLastError());
+        ROS_ERROR_STREAM("Invalid spline optimizer state: " << spline_status.message);
         return false;
     }
 
@@ -348,7 +350,7 @@ bool MSPlanner::optimizer(){
     trajectoryPathPub(init_final_traj_, iniStateXYTheta, initTrajPathPub_); 
     trajectoryPointPub(init_final_traj_, iniStateXYTheta, initTrajPointPub_, Eigen::Vector3d(173, 127, 168));
 
-    Eigen::VectorXd x = spline_optimizer_.generateInitialGuess();
+    Eigen::VectorXd x = spline_optimizer_.generateInitialGuess(spline_context_);
 
     double cost;
     int result;
@@ -649,13 +651,18 @@ double MSPlanner::costFunctionCallback(void *ptr,
     traj_opt_components::LinearTimeCost time_cost;
     time_cost.weight = obj.penaltyWt.time_weight;
 
-    const double cost = obj.spline_optimizer_.evaluate(x,
-                                                       g,
-                                                       time_cost,
-                                                       ZeroIntegralCost(),
-                                                       obj.formal_cost_adapter_,
-                                                       &obj.spline_workspace_);
-    return cost;
+    static const ZeroIntegralCost zero_integral_cost{};
+    MSPlanner::SplineOptimizer::EvaluateSpec<
+        traj_opt_components::LinearTimeCost,
+        ZeroIntegralCost,
+        SplineTrajectory::VoidWaypointsCost,
+        MSPlanner::SplineOptimizer::VoidSampleCost,
+        traj_opt_adapters::DdrFormalPenaltyCostAdapter<MSPlanner>> spec;
+    spec.time_cost = &time_cost;
+    spec.integral_cost = &zero_integral_cost;
+    spec.trajectory_cost = &obj.formal_cost_adapter_;
+    const auto evaluation = obj.spline_optimizer_.evaluate(obj.spline_context_, x, g, spec);
+    return evaluation ? evaluation.cost : inf;
 }
 
 double MSPlanner::evaluateFormalTrajectoryCost(const SplineType &spline,
@@ -1087,14 +1094,16 @@ double MSPlanner::accumulateWeightedEnergyCost(const SplineType &spline,
     return cost;
 }
 
-void MSPlanner::updateSplineReferenceState()
+MSPlanner::SplineOptimizer::Status MSPlanner::updateSplineReferenceState()
 {
     spline_waypoints_ = TrajectoryAdapter::buildWaypoints(iniState, finState, Innerpoints);
     spline_boundary_conditions_ = TrajectoryAdapter::buildBoundaryConditions(iniState, finState);
-    spline_optimizer_.setInitState(TrajectoryAdapter::buildSegmentTimes(pieceTime),
-                                   spline_waypoints_,
-                                   0.0,
-                                   spline_boundary_conditions_);
+    SplineOptimizer::ProblemDefinition problem;
+    problem.time_segments = TrajectoryAdapter::buildSegmentTimes(pieceTime);
+    problem.waypoints = spline_waypoints_;
+    problem.start_time = 0.0;
+    problem.bc = spline_boundary_conditions_;
+    return spline_optimizer_.prepareContext(problem, spline_context_);
 }
 
 void MSPlanner::decodeDecisionVariables(const Eigen::VectorXd &x,
@@ -1307,13 +1316,18 @@ double MSPlanner::costFunctionCallbackPath(void *ptr,
     traj_opt_components::LinearTimeCost time_cost;
     time_cost.weight = obj.PathpenaltyWt.time_weight;
 
-    const double cost = obj.spline_optimizer_.evaluate(x,
-                                                       g,
-                                                       time_cost,
-                                                       ZeroIntegralCost(),
-                                                       obj.path_cost_adapter_,
-                                                       &obj.spline_workspace_);
-    return cost;
+    static const ZeroIntegralCost zero_integral_cost{};
+    MSPlanner::SplineOptimizer::EvaluateSpec<
+        traj_opt_components::LinearTimeCost,
+        ZeroIntegralCost,
+        SplineTrajectory::VoidWaypointsCost,
+        MSPlanner::SplineOptimizer::VoidSampleCost,
+        traj_opt_adapters::DdrPathPenaltyCostAdapter<MSPlanner>> spec;
+    spec.time_cost = &time_cost;
+    spec.integral_cost = &zero_integral_cost;
+    spec.trajectory_cost = &obj.path_cost_adapter_;
+    const auto evaluation = obj.spline_optimizer_.evaluate(obj.spline_context_, x, g, spec);
+    return evaluation ? evaluation.cost : inf;
 }
 
 double MSPlanner::evaluatePathTrajectoryCost(const SplineType &spline,

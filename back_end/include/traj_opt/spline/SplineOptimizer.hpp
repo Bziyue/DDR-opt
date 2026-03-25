@@ -7,198 +7,15 @@
 #include <cmath>
 #include <iostream>
 #include <iomanip>
-#include <memory>
 #include <type_traits> 
 #include <utility>   
 #include <sstream>  
+#include <cassert>
+#include <optional>
 
 namespace SplineTrajectory
 {
-    // =========================================================================
-    //  INTERFACE DOCUMENTATION (Reference Only)
-    //  These definitions are provided for documentation purposes. 
-    //  User-defined types (Functors/Lambdas) do not need to inherit from them, 
-    //  but must satisfy the function signatures verified by TypeTraits.
-    // =========================================================================
-
-#if 0
-    /**
-     * @brief TimeMap Interface Protocol
-     * Defines how the unconstrained optimization variable (tau) maps to physical time (T).
-     */
-    struct TimeMapProtocol
-    {
-        // Convert unconstrained variable 'tau' to physical time 'T'
-        double toTime(double tau) const;
-        // Convert physical time 'T' to unconstrained variable 'tau'
-        double toTau(double T) const;
-        // Compute gradient w.r.t tau given gradient w.r.t T (Chain Rule)
-        // Returns: dCost/dtau = (dCost/dT) * (dT/dtau)
-        double backward(double tau, double T, double gradT) const;
-    };
-
-    /**
-     * @brief SpatialMap Interface Protocol [NEW]
-     * Defines how the unconstrained variable (xi) maps to physical position (p).
-     * Unlike TimeMap, this acts on an instance level to hold constraints (e.g., Polyhedrons).
-     *
-     * Global Absolute Indexing:
-     * - index = 0: The Start Point of the trajectory
-     * - index = 1 to N-1: The Inner Waypoints
-     * - index = N: The End Point of the trajectory
-     */
-    struct SpatialMapProtocol
-    {
-        // Get dimension of unconstrained variable xi for the point at global 'index'
-        int getUnconstrainedDim(int index) const;
-
-        // Forward: xi (unconstrained) -> p (physical)
-        Eigen::VectorXd toPhysical(const Eigen::VectorXd& xi, int index) const;
-
-        // Backward: p (physical) -> xi (unconstrained), used for initial guess
-        Eigen::VectorXd toUnconstrained(const Eigen::VectorXd& p, int index) const;
-
-        // Gradient: dCost/dxi = (dCost/dp) * (dp/dxi)
-        Eigen::VectorXd backwardGrad(const Eigen::VectorXd& xi, const Eigen::VectorXd& grad_p, int index) const;
-    };
-
-    /**
-     * @brief IntegralCostFunc Protocol
-     * Functor to compute trajectory integral cost.
-     * Returns the scalar cost value.
-     */
-    struct IntegralCostProtocol
-    {
-        /**
-         * @param t         Relative time inside the segment [0, T]
-         * @param t_global  Global time from start of trajectory    
-         * @param i         Segment index
-         * @param step_in_seg Segment-local integration sample index
-         * @param p         Position vector (dim)
-         * @param v         Velocity vector (dim)
-         * @param a         Acceleration vector (dim)
-         * @param j         Jerk vector (dim)
-         * @param s         Snap vector (dim)
-         * @param gp        [Output] Gradient w.r.t Position
-         * @param gv        [Output] Gradient w.r.t Velocity
-         * @param ga        [Output] Gradient w.r.t Acceleration
-         * @param gj        [Output] Gradient w.r.t Jerk
-         * @param gs        [Output] Gradient w.r.t Snap
-         * @param gt        [Output] Gradient w.r.t Explicit Time (e.g. dynamic obstacles)
-         * @return          Scalar cost value to be accumulated
-         */
-        double operator()(double t, double t_global, int i, int step_in_seg,
-                          const Eigen::VectorXd &p, const Eigen::VectorXd &v,
-                          const Eigen::VectorXd &a, const Eigen::VectorXd &j, const Eigen::VectorXd &s,
-                          Eigen::VectorXd &gp, Eigen::VectorXd &gv, Eigen::VectorXd &ga,
-                          Eigen::VectorXd &gj, Eigen::VectorXd &gs, double &gt) const;
-    };
-
-    /**
-     * @brief TimeCostFunc Protocol
-     * Functor to compute cost based on ALL segment durations.
-     * Allows for global time constraints (e.g., total time).
-     */
-    struct TimeCostProtocol
-    {
-        /**
-         * @param Ts    Physical durations of all segments (std::vector<double>)
-         * @param grad  [Output] Gradient of cost w.r.t each T (Eigen::VectorXd ref)
-         * @return      Cost value
-         */
-        double operator()(const std::vector<double>& Ts, Eigen::VectorXd &grad) const;
-    };
-
-    /**
-     * @brief WaypointsCostProtocol
-     * Functor to compute cost based on DISCRETE waypoints (q).
-     * This is separate from the integral cost along the continuous curve.
-     */
-    struct WaypointsCostProtocol
-    {
-        /**
-         * @param waypoints  The full list of waypoints [q0, q1, ... qN] (Physical space)
-         * @param grad_q     [Output] Gradient w.r.t each waypoint (Matrix: (N+1) x DIM)
-         * Rows correspond to q0, q1, ... qN
-         * @return           Cost value
-         */
-        double operator()(const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
-                          Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &grad_q) const;
-    };
-
-    /**
-     * @brief TrajectoryCostProtocol
-     * Functor to compute costs that depend on the entire working spline state,
-     * not just pointwise samples. This is useful for costs involving
-     * accumulated/integrated states, cross-segment coupling, or custom
-     * gradient propagation schemes.
-     *
-     * The functor should add its contribution directly into @p grads.
-     */
-    struct TrajectoryCostProtocol
-    {
-        /**
-         * @param spline      Working spline built from current optimization vars
-         * @param Ts          Physical durations of all segments
-         * @param waypoints   Working waypoint matrix
-         * @param start_time  Global start time
-         * @param bc          Working boundary conditions
-         * @param grads       [In/Out] Gradients in spline state space
-         * @return            Scalar cost value
-         */
-        double operator()(const QuinticSplineND<3> &spline,
-                          const std::vector<double> &Ts,
-                          const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
-                          double start_time,
-                          const BoundaryConditions<3> &bc,
-                          QuinticSplineND<3>::Gradients &grads) const;
-    };
-
-    /**
-     * @brief AuxiliaryStateMap Protocol [NEW]
-     * Adds an optional extra optimization variable block that can modify the
-     * effective spline state before evaluation, and map gradients back after
-     * spline back-propagation.
-     *
-     * Typical use cases:
-     * - A shared total-time variable that overrides segment times
-     * - A trajectory splice/start-state variable sampled from an external motion
-     * - Other low-dimensional variables that affect waypoints / boundary states
-     *
-     * The optimizer owns the canonical reference state. The auxiliary map:
-     * 1) provides the initial unconstrained auxiliary variables
-     * 2) applies them onto the working state before spline.update(...)
-     * 3) pulls gradients back from the working state after spline.propagateGrad(...)
-     */
-    struct AuxiliaryStateMapProtocol
-    {
-        // Dimension of the auxiliary optimization variable block.
-        int getDimension() const;
-
-        // Create initial unconstrained auxiliary variables from the reference state.
-        Eigen::VectorXd getInitialValue(const std::vector<double> &ref_times,
-                                        const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &ref_waypoints,
-                                        double ref_start_time,
-                                        const BoundaryConditions<3> &ref_bc) const;
-
-        // Apply the auxiliary variables onto the working state before spline update.
-        void apply(const Eigen::VectorXd &z,
-                   std::vector<double> &times,
-                   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
-                   double &start_time,
-                   BoundaryConditions<3> &bc) const;
-
-        // Back-propagate gradients from the working state to z.
-        double backward(const Eigen::VectorXd &z,
-                        const QuinticSplineND<3> &spline,
-                        const std::vector<double> &times,
-                        const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
-                        double start_time,
-                        const BoundaryConditions<3> &bc,
-                        QuinticSplineND<3>::Gradients &grads,
-                        Eigen::VectorXd &grad_z) const;
-    };
-#endif
+    // Protocol reference lives in SplineOptimizerProtocols.md in the same directory.
 
     namespace TypeTraits
     {
@@ -301,6 +118,19 @@ namespace SplineTrajectory
                 std::declval<VecT &>(),                  // gj
                 std::declval<VecT &>(),                  // gs
                 std::declval<double &>()                 // gt
+            )))
+        >> : std::true_type {};
+
+
+        template <typename T, typename SamplesType, typename GradMatrixType, typename = void>
+        struct HasSampleCostInterface : std::false_type {};
+
+        template <typename T, typename SamplesType, typename GradMatrixType>
+        struct HasSampleCostInterface<T, SamplesType, GradMatrixType, void_t<
+            decltype(static_cast<double>(std::declval<T>()(
+                std::declval<const SamplesType &>(),
+                std::declval<GradMatrixType &>(),
+                std::declval<Eigen::VectorXd &>()
             )))
         >> : std::true_type {};
 
@@ -503,16 +333,19 @@ namespace SplineTrajectory
         }
     };
 
-    struct OptimizationFlags
+    struct BoundaryDerivativeMask
     {
-        bool start_p = false;
-        bool start_v = false;
-        bool start_a = false;
-        bool start_j = false;
-        bool end_p = false;
-        bool end_v = false;
-        bool end_a = false;
-        bool end_j = false;
+        bool v = false;
+        bool a = false;
+        bool j = false;
+    };
+
+    struct OptimizationMask
+    {
+        std::vector<uint8_t> time;
+        std::vector<uint8_t> waypoints;
+        BoundaryDerivativeMask start;
+        BoundaryDerivativeMask end;
     };
 
     template <int DIM,
@@ -541,64 +374,259 @@ namespace SplineTrajectory
         using VectorType = typename SplineType::VectorType;
         using MatrixType = typename SplineType::MatrixType;
         using WaypointsType = MatrixType;
+        using SampleGradMatrix = Eigen::Matrix<double, DIM, Eigen::Dynamic>;
 
-        /**
-         * @brief Workspace holds all mutable state required during optimization.
-         * This allows the Optimizer to be stateless and thread-safe.
-         */
-        struct Workspace
+        struct ProblemDefinition
+        {
+            std::vector<double> time_segments;
+            WaypointsType waypoints;
+            double start_time = 0.0;
+            BoundaryConditions<DIM> bc;
+            std::optional<OptimizationMask> mask;
+        };
+
+        struct OptimizerConfig
+        {
+            const TimeMap *time_map = nullptr;
+            const SpatialMap *spatial_map = nullptr;
+            const AuxiliaryStateMap *auxiliary_state_map = nullptr;
+            double rho_energy = 0.0;
+            int integral_num_steps = 64;
+        };
+
+        struct IntegralSample
         {
             EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-            SplineType spline;
-            std::vector<double> cache_times;
-            WaypointsType cache_waypoints;
+            int seg_idx = 0;
+            int step_in_seg = 0;
+            int sample_buffer_index = 0;
+            double alpha = 0.0;
+            double t_local = 0.0;
+            double t_global = 0.0;
+            double trap_weight = 0.0;
+            double dt = 0.0;
+            Eigen::Matrix<double, 1, SplineType::COEFF_NUM> b_p;
+            VectorType p = VectorType::Zero();
+            VectorType v = VectorType::Zero();
+        };
 
-            Eigen::VectorXd cache_gdT;
-            MatrixType cache_gdC;
-            Eigen::VectorXd user_gdT_buffer;
+        using IntegralSampleBuffer = std::vector<IntegralSample, Eigen::aligned_allocator<IntegralSample>>;
 
-            typename SplineType::Gradients grads;
-            typename SplineType::Gradients energy_grads;
-
-            Eigen::VectorXd explicit_time_grad_buffer;
-            MatrixType discrete_grad_q_buffer;
-            std::vector<double> segment_start_times;
-            std::vector<double> segment_costs;
-
-            void resize(int num_segments)
+        struct VoidSampleCost
+        {
+            template <typename SamplesType>
+            double operator()(const SamplesType & /*samples*/,
+                              SampleGradMatrix & /*grad_p*/,
+                              Eigen::VectorXd & /*grad_t_global*/) const
             {
-                if (static_cast<int>(cache_times.size()) != num_segments)
-                {
-                    cache_times.resize(num_segments);
-                    cache_waypoints.resize(num_segments + 1, DIM);
-                    cache_gdT.resize(num_segments);
-                    user_gdT_buffer.resize(num_segments);
-                    cache_gdC.resize(num_segments * SplineType::COEFF_NUM, DIM);
-                    explicit_time_grad_buffer.resize(num_segments);
-                    discrete_grad_q_buffer.resize(num_segments + 1, DIM);
-                    segment_start_times.resize(num_segments);
-                    segment_costs.resize(num_segments);
-                }
+                return 0.0;
             }
         };
 
-    private:
-        struct SpatialVariableLayout
+        struct TimeVariableLayout
+        {
+            int segment_index = 0;
+            int offset = 0;
+        };
+
+        struct PointVariableLayout
         {
             int point_index = 0;
             int offset = 0;
             int dof = 0;
         };
 
-        std::vector<double> ref_times_;
-        WaypointsType ref_waypoints_;
-        BoundaryConditions<DIM> ref_bc_;
-        double start_time_ = 0.0;
+        struct DecisionVariableLayout
+        {
+            std::vector<TimeVariableLayout> time;
+            std::vector<PointVariableLayout> waypoints;
+            int boundary_derivatives_offset = 0;
+            int auxiliary_offset = 0;
+            int total_dimension = 0;
+        };
 
-        OptimizationFlags flags_;
-        int num_segments_ = 0;
-        bool is_valid_ = false;
+        enum class ErrorCode
+        {
+            None = 0,
+            ValidationFailed,
+            InvalidOptimizerState,
+            InvalidIntegralSteps,
+            DimensionMismatch,
+            NullContext,
+            NullTimeCost,
+            NullIntegralCost,
+            NullWaypointsCost,
+            NullSampleCost,
+            NullTrajectoryCost
+        };
+
+        struct ResultBase
+        {
+            bool ok = false;
+            ErrorCode code = ErrorCode::None;
+            std::string message;
+
+            explicit operator bool() const { return ok; }
+        };
+
+        struct Status : ResultBase
+        {
+        };
+
+        struct EvaluationResult : ResultBase
+        {
+            double cost = 0.0;
+        };
+
+        struct WorkingState;
+        struct EvaluationBuffers;
+        struct OptimizationContext;
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc = VoidWaypointsCost,
+                  typename SampleCostFunc = VoidSampleCost,
+                  typename TrajectoryCostFunc = VoidTrajectoryCost<SplineType, DIM>,
+                  typename Executor = SerialExecutor>
+        struct EvaluateSpec
+        {
+            const TimeCostFunc *time_cost = nullptr;
+            const IntegralCostFunc *integral_cost = nullptr;
+            const WaypointsCostFunc *waypoints_cost = nullptr;
+            const SampleCostFunc *sample_cost = nullptr;
+            const TrajectoryCostFunc *trajectory_cost = nullptr;
+            Executor executor{};
+        };
+
+        template <typename TimeCostFunc, typename IntegralCostFunc,
+                  typename Executor = SerialExecutor>
+        static EvaluateSpec<TimeCostFunc, IntegralCostFunc, VoidWaypointsCost,
+                            VoidSampleCost, VoidTrajectoryCost<SplineType, DIM>, Executor>
+        makeEvaluateSpec(const TimeCostFunc &time_cost,
+                         const IntegralCostFunc &integral_cost,
+                         const Executor &executor = Executor())
+        {
+            EvaluateSpec<TimeCostFunc, IntegralCostFunc, VoidWaypointsCost,
+                         VoidSampleCost, VoidTrajectoryCost<SplineType, DIM>, Executor> spec;
+            spec.time_cost = &time_cost;
+            spec.integral_cost = &integral_cost;
+            spec.executor = executor;
+            return spec;
+        }
+
+        struct WorkingState
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            SplineType spline;
+            std::vector<double> times;
+            WaypointsType waypoints;
+            BoundaryConditions<DIM> bc;
+            double start_time = 0.0;
+            Eigen::VectorXd auxiliary_vars;
+
+            void resize(int num_segments)
+            {
+                if (static_cast<int>(times.size()) != num_segments)
+                {
+                    times.resize(num_segments);
+                    waypoints.resize(num_segments + 1, DIM);
+                    auxiliary_vars.resize(0);
+                }
+            }
+        };
+
+        struct EvaluationBuffers
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            Eigen::VectorXd grad_times;
+            MatrixType grad_coeffs;
+            Eigen::VectorXd time_cost_grad_buffer;
+
+            typename SplineType::Gradients grads;
+            typename SplineType::Gradients energy_grads;
+
+            Eigen::VectorXd global_time_grad_buffer;
+            MatrixType waypoint_grad_buffer;
+            SampleGradMatrix sample_position_grad_buffer;
+            Eigen::VectorXd sample_time_grad_buffer;
+            std::vector<double> segment_begin_times;
+            std::vector<double> segment_cost_buffer;
+            IntegralSampleBuffer integral_samples;
+            bool record_integral_samples = false;
+
+            void resize(int num_segments)
+            {
+                if (grad_times.size() != num_segments)
+                {
+                    grad_times.resize(num_segments);
+                    time_cost_grad_buffer.resize(num_segments);
+                    grad_coeffs.resize(num_segments * SplineType::COEFF_NUM, DIM);
+                    global_time_grad_buffer.resize(num_segments);
+                    waypoint_grad_buffer.resize(num_segments + 1, DIM);
+                    sample_position_grad_buffer.resize(DIM, 0);
+                    sample_time_grad_buffer.resize(0);
+                    segment_begin_times.resize(num_segments);
+                    segment_cost_buffer.resize(num_segments);
+                    integral_samples.clear();
+                }
+            }
+        };
+
+        struct PreparedData
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            ProblemDefinition problem;
+            OptimizationMask active_mask;
+            int num_segments = 0;
+            DecisionVariableLayout layout;
+            Status validation;
+
+            bool isValid() const { return validation.ok; }
+        };
+
+        struct RuntimeData
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            WorkingState state;
+            EvaluationBuffers buffers;
+
+            void resize(int num_segments)
+            {
+                state.resize(num_segments);
+                buffers.resize(num_segments);
+            }
+        };
+
+        /**
+         * @brief OptimizationContext holds both prepared problem data and mutable
+         * runtime buffers required during optimization.
+         * Callers must provide one context per active evaluation flow.
+         */
+        struct OptimizationContext
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            PreparedData prepared;
+            RuntimeData runtime;
+
+            bool isValid() const { return prepared.validation.ok; }
+        };
+
+    private:
+        enum class BoundaryDerivativeSlot
+        {
+            StartV,
+            StartA,
+            StartJ,
+            EndV,
+            EndA,
+            EndJ
+        };
 
         double rho_energy_ = 0.0;
         int integral_num_steps_ = 64;
@@ -611,110 +639,130 @@ namespace SplineTrajectory
         const SpatialMap* active_spatial_map_ = nullptr;
         const AuxiliaryStateMap* active_auxiliary_state_map_ = nullptr;
 
-        mutable std::unique_ptr<Workspace> internal_ws_;
-        
-        mutable std::string last_error_message_;
-        mutable std::vector<SpatialVariableLayout> spatial_layout_;
-        mutable int derivatives_offset_ = 0;
-        mutable int auxiliary_offset_ = 0;
-        mutable int total_dimension_ = 0;
-        mutable bool layout_dirty_ = true;
-        
-        /**
-         * @brief Helper method to retrieve or create the internal workspace.
-         * @return Pointer to the internal workspace.
-         */
-        Workspace* getOrCreateInternalWorkspace() const
+        void resolveActiveOptimizationMask(OptimizationContext &ctx) const
         {
-            if (!internal_ws_)
+            ctx.prepared.active_mask = ctx.prepared.problem.mask.value_or(OptimizationMask{});
+            if (ctx.prepared.active_mask.time.empty())
             {
-                internal_ws_ = std::make_unique<Workspace>();
+                ctx.prepared.active_mask.time.assign(ctx.prepared.num_segments, static_cast<uint8_t>(1));
             }
-            return internal_ws_.get();
+            if (ctx.prepared.active_mask.waypoints.empty())
+            {
+                ctx.prepared.active_mask.waypoints.assign(ctx.prepared.num_segments + 1, static_cast<uint8_t>(0));
+                for (int i = 1; i < ctx.prepared.num_segments; ++i)
+                {
+                    ctx.prepared.active_mask.waypoints[i] = static_cast<uint8_t>(1);
+                }
+            }
         }
 
-        void markLayoutDirty()
+        bool isTimeOptimized(const OptimizationContext &ctx, int idx) const
         {
-            layout_dirty_ = true;
+            assert(static_cast<size_t>(ctx.prepared.num_segments) == ctx.prepared.active_mask.time.size());
+            return idx >= 0 &&
+                   idx < static_cast<int>(ctx.prepared.active_mask.time.size()) &&
+                   ctx.prepared.active_mask.time[idx] != 0;
         }
 
-        bool isSpatialOptimized(int idx) const
+        bool isWaypointOptimized(const OptimizationContext &ctx, int idx) const
         {
-            if (idx == 0)
-            {
-                return flags_.start_p;
-            }
-            if (idx == num_segments_)
-            {
-                return flags_.end_p;
-            }
-            return true;
+            assert(static_cast<size_t>(ctx.prepared.num_segments + 1) == ctx.prepared.active_mask.waypoints.size());
+            return idx >= 0 &&
+                   idx < static_cast<int>(ctx.prepared.active_mask.waypoints.size()) &&
+                   ctx.prepared.active_mask.waypoints[idx] != 0;
         }
 
-        int countOptimizedDerivativeBlocks() const
+        template <typename Fn>
+        void forEachOptimizedBoundaryDerivativeSlot(const OptimizationContext &ctx, Fn &&fn) const
+        {
+            if (ctx.prepared.active_mask.start.v) fn(BoundaryDerivativeSlot::StartV);
+            if constexpr (SplineType::ORDER >= 5)
+            {
+                if (ctx.prepared.active_mask.start.a) fn(BoundaryDerivativeSlot::StartA);
+            }
+            if constexpr (SplineType::ORDER >= 7)
+            {
+                if (ctx.prepared.active_mask.start.j) fn(BoundaryDerivativeSlot::StartJ);
+            }
+
+            if (ctx.prepared.active_mask.end.v) fn(BoundaryDerivativeSlot::EndV);
+            if constexpr (SplineType::ORDER >= 5)
+            {
+                if (ctx.prepared.active_mask.end.a) fn(BoundaryDerivativeSlot::EndA);
+            }
+            if constexpr (SplineType::ORDER >= 7)
+            {
+                if (ctx.prepared.active_mask.end.j) fn(BoundaryDerivativeSlot::EndJ);
+            }
+        }
+
+        int countOptimizedDerivativeBlocks(const OptimizationContext &ctx) const
         {
             int blocks = 0;
-            if (flags_.start_v) ++blocks;
+            if (ctx.prepared.active_mask.start.v) ++blocks;
             if constexpr (SplineType::ORDER >= 5)
             {
-                if (flags_.start_a) ++blocks;
+                if (ctx.prepared.active_mask.start.a) ++blocks;
             }
             if constexpr (SplineType::ORDER >= 7)
             {
-                if (flags_.start_j) ++blocks;
+                if (ctx.prepared.active_mask.start.j) ++blocks;
             }
 
-            if (flags_.end_v) ++blocks;
+            if (ctx.prepared.active_mask.end.v) ++blocks;
             if constexpr (SplineType::ORDER >= 5)
             {
-                if (flags_.end_a) ++blocks;
+                if (ctx.prepared.active_mask.end.a) ++blocks;
             }
             if constexpr (SplineType::ORDER >= 7)
             {
-                if (flags_.end_j) ++blocks;
+                if (ctx.prepared.active_mask.end.j) ++blocks;
             }
             return blocks;
         }
 
-        void rebuildLayoutCache() const
+        void rebuildLayoutCache(OptimizationContext &ctx) const
         {
-            spatial_layout_.clear();
+            ctx.prepared.layout.time.clear();
+            ctx.prepared.layout.waypoints.clear();
 
-            if (num_segments_ <= 0)
+            if (ctx.prepared.num_segments <= 0)
             {
-                derivatives_offset_ = 0;
-                auxiliary_offset_ = 0;
-                total_dimension_ = 0;
-                layout_dirty_ = false;
+                ctx.prepared.layout.boundary_derivatives_offset = 0;
+                ctx.prepared.layout.auxiliary_offset = 0;
+                ctx.prepared.layout.total_dimension = 0;
                 return;
             }
 
-            int offset = num_segments_;
-            for (int i = 0; i <= num_segments_; ++i)
+            int offset = 0;
+            for (int i = 0; i < ctx.prepared.num_segments; ++i)
             {
-                if (!isSpatialOptimized(i))
+                if (!isTimeOptimized(ctx, i))
+                {
+                    continue;
+                }
+
+                ctx.prepared.layout.time.push_back(TimeVariableLayout{i, offset});
+                ++offset;
+            }
+
+            for (int i = 0; i <= ctx.prepared.num_segments; ++i)
+            {
+                if (!isWaypointOptimized(ctx, i))
                 {
                     continue;
                 }
 
                 const int dof = active_spatial_map_->getUnconstrainedDim(i);
-                spatial_layout_.push_back(SpatialVariableLayout{i, offset, dof});
+                ctx.prepared.layout.waypoints.push_back(PointVariableLayout{i, offset, dof});
                 offset += dof;
             }
 
-            derivatives_offset_ = offset;
-            auxiliary_offset_ = derivatives_offset_ + countOptimizedDerivativeBlocks() * DIM;
-            total_dimension_ = auxiliary_offset_ + active_auxiliary_state_map_->getDimension();
-            layout_dirty_ = false;
-        }
-
-        void ensureLayoutCache() const
-        {
-            if (!layout_dirty_)
-            {
-                return;
-            }
-            rebuildLayoutCache();
+            ctx.prepared.layout.boundary_derivatives_offset = offset;
+            ctx.prepared.layout.auxiliary_offset =
+                ctx.prepared.layout.boundary_derivatives_offset + countOptimizedDerivativeBlocks(ctx) * DIM;
+            ctx.prepared.layout.total_dimension =
+                ctx.prepared.layout.auxiliary_offset + active_auxiliary_state_map_->getDimension();
         }
         
         static constexpr double MIN_VALID_DURATION = 1e-3; // 1 ms
@@ -722,659 +770,805 @@ namespace SplineTrajectory
     public:
         SplineOptimizer()
         {
-            active_time_map_ = &default_time_map_;
-            active_spatial_map_ = &default_spatial_map_;
-            active_auxiliary_state_map_ = &default_auxiliary_state_map_;
+            OptimizerConfig config;
+            setConfig(config);
         }
 
-        SplineOptimizer(const SplineOptimizer &other)
-            : ref_times_(other.ref_times_),
-              ref_waypoints_(other.ref_waypoints_),
-              ref_bc_(other.ref_bc_),
-              start_time_(other.start_time_),
-              flags_(other.flags_),
-              num_segments_(other.num_segments_),
-              is_valid_(other.is_valid_),
-              rho_energy_(other.rho_energy_),
-              integral_num_steps_(other.integral_num_steps_),
-              default_time_map_(other.default_time_map_),
-              default_spatial_map_(other.default_spatial_map_),
-              default_auxiliary_state_map_(other.default_auxiliary_state_map_),
-              spatial_layout_(other.spatial_layout_),
-              derivatives_offset_(other.derivatives_offset_),
-              auxiliary_offset_(other.auxiliary_offset_),
-              total_dimension_(other.total_dimension_),
-              layout_dirty_(other.layout_dirty_)
-        {
-            active_time_map_ = (other.active_time_map_ == &other.default_time_map_)
-                              ? &default_time_map_
-                              : other.active_time_map_;
-            active_spatial_map_ = (other.active_spatial_map_ == &other.default_spatial_map_)
-                                  ? &default_spatial_map_
-                                  : other.active_spatial_map_;
-            active_auxiliary_state_map_ = (other.active_auxiliary_state_map_ == &other.default_auxiliary_state_map_)
-                                          ? &default_auxiliary_state_map_
-                                          : other.active_auxiliary_state_map_;
+        SplineOptimizer(const SplineOptimizer &) = delete;
+        SplineOptimizer &operator=(const SplineOptimizer &) = delete;
+        SplineOptimizer(SplineOptimizer &&) = delete;
+        SplineOptimizer &operator=(SplineOptimizer &&) = delete;
 
-            if (other.internal_ws_)
-                internal_ws_ = std::unique_ptr<Workspace>(new Workspace(*other.internal_ws_));
-        }
-
-        SplineOptimizer &operator=(const SplineOptimizer &other)
+        Status setConfig(const OptimizerConfig &config)
         {
-            if (this != &other)
+            if (config.integral_num_steps <= 0)
             {
-                ref_times_ = other.ref_times_;
-                ref_waypoints_ = other.ref_waypoints_;
-                ref_bc_ = other.ref_bc_;
-                start_time_ = other.start_time_;
-                flags_ = other.flags_;
-                num_segments_ = other.num_segments_;
-                is_valid_ = other.is_valid_;
-                rho_energy_ = other.rho_energy_;
-                integral_num_steps_ = other.integral_num_steps_;
-                default_time_map_ = other.default_time_map_;
-                default_spatial_map_ = other.default_spatial_map_;
-                default_auxiliary_state_map_ = other.default_auxiliary_state_map_;
-                spatial_layout_ = other.spatial_layout_;
-                derivatives_offset_ = other.derivatives_offset_;
-                auxiliary_offset_ = other.auxiliary_offset_;
-                total_dimension_ = other.total_dimension_;
-                layout_dirty_ = other.layout_dirty_;
-
-                active_time_map_ = (other.active_time_map_ == &other.default_time_map_)
-                                  ? &default_time_map_
-                                  : other.active_time_map_;
-                active_spatial_map_ = (other.active_spatial_map_ == &other.default_spatial_map_)
-                                      ? &default_spatial_map_
-                                      : other.active_spatial_map_;
-                active_auxiliary_state_map_ = (other.active_auxiliary_state_map_ == &other.default_auxiliary_state_map_)
-                                              ? &default_auxiliary_state_map_
-                                              : other.active_auxiliary_state_map_;
-
-                if (other.internal_ws_)
-                    internal_ws_ = std::unique_ptr<Workspace>(new Workspace(*other.internal_ws_));
-                else
-                    internal_ws_.reset();
+                return makeErrorStatus(ErrorCode::InvalidIntegralSteps,
+                                       "[SplineOptimizer Error] integral_num_steps must be positive.");
             }
-            return *this;
+
+            active_time_map_ = (config.time_map != nullptr) ? config.time_map : &default_time_map_;
+            active_spatial_map_ = (config.spatial_map != nullptr) ? config.spatial_map : &default_spatial_map_;
+            active_auxiliary_state_map_ =
+                (config.auxiliary_state_map != nullptr) ? config.auxiliary_state_map : &default_auxiliary_state_map_;
+            rho_energy_ = config.rho_energy;
+            integral_num_steps_ = config.integral_num_steps;
+            return makeOkStatus();
+        }
+
+        OptimizerConfig getActiveConfig() const
+        {
+            OptimizerConfig config;
+            config.time_map = active_time_map_;
+            config.spatial_map = active_spatial_map_;
+            config.auxiliary_state_map = active_auxiliary_state_map_;
+            config.rho_energy = rho_energy_;
+            config.integral_num_steps = integral_num_steps_;
+            return config;
         }
 
         /**
-         * @brief Set the TimeMap to use for time transformations.
-         * @param map Pointer to a TimeMap instance (can be nullptr to reset to default).
-         * The optimizer does not take ownership; the map must remain valid.
+         * @brief Prepare a full optimization context from a problem definition.
+         * @return Validation status for the prepared context.
          */
-        void setTimeMap(const TimeMap* map)
+        Status prepareContext(const ProblemDefinition &problem, OptimizationContext &ctx) const
         {
-            active_time_map_ = (map != nullptr) ? map : &default_time_map_;
+            ctx.prepared.problem = problem;
+            ctx.prepared.num_segments = static_cast<int>(ctx.prepared.problem.time_segments.size());
+            resolveActiveOptimizationMask(ctx);
+            rebuildLayoutCache(ctx);
+            ctx.prepared.validation = validateConfiguration(ctx, true);
+            return ctx.prepared.validation;
         }
 
-        /**
-         * @brief Set the SpatialMap to use for spatial transformations.
-         * @param map Pointer to a SpatialMap instance (can be nullptr to reset to default).
-         * The optimizer does not take ownership; the map must remain valid.
-         */
-        void setSpatialMap(const SpatialMap* map)
+        static ProblemDefinition makeProblemFromTimePoints(const std::vector<double> &time_points,
+                                                           const WaypointsType &waypoints,
+                                                           const BoundaryConditions<DIM> &bc,
+                                                           std::optional<OptimizationMask> mask = std::nullopt)
         {
-            active_spatial_map_ = (map != nullptr) ? map : &default_spatial_map_;
-            markLayoutDirty();
-        }
+            ProblemDefinition problem;
+            problem.waypoints = waypoints;
+            problem.bc = bc;
+            problem.mask = std::move(mask);
 
-        /**
-         * @brief Set the AuxiliaryStateMap for optional extra optimization variables.
-         * @param map Pointer to an AuxiliaryStateMap instance (can be nullptr to reset to default).
-         * The optimizer does not take ownership; the map must remain valid.
-         */
-        void setAuxiliaryStateMap(const AuxiliaryStateMap* map)
-        {
-            active_auxiliary_state_map_ = (map != nullptr) ? map : &default_auxiliary_state_map_;
-            markLayoutDirty();
-        }
-
-        /**
-         * @brief Initialize using Absolute Time Points.
-         * Converts time points to segments.
-         * @return true if the initial state is valid, false otherwise.
-         */
-        bool setInitState(const std::vector<double> &t_points,
-                          const WaypointsType &waypoints,
-                          const BoundaryConditions<DIM> &bc)
-        {
-            last_error_message_.clear();
-            
-            if (t_points.empty())
+            if (!time_points.empty())
             {
-                last_error_message_ = "Input time points vector is empty";
-                is_valid_ = false;
-                return false;
+                problem.start_time = time_points.front();
+                problem.time_segments.reserve(time_points.size() - 1);
+                for (size_t i = 1; i < time_points.size(); ++i)
+                {
+                    problem.time_segments.push_back(time_points[i] - time_points[i - 1]);
+                }
             }
 
-            std::vector<double> time_segments;
-            time_segments.reserve(t_points.size() - 1);
-            for (size_t i = 1; i < t_points.size(); ++i)
-            {
-                time_segments.push_back(t_points[i] - t_points[i - 1]);
-            }
-
-            return setInitState(time_segments, waypoints, t_points.front(), bc);
+            return problem;
         }
 
-        /**
-         * @brief Initialize using Time Segments (Durations).
-         * @return true if the initial state is valid, false otherwise.
-         */
-        bool setInitState(const std::vector<double> &time_segments,
-                          const WaypointsType &waypoints,
-                          double start_time,
-                          const BoundaryConditions<DIM> &bc)
+        static OptimizationMask makeFullOptimizationMask(int num_segments)
         {
-            last_error_message_.clear();
-            
-            start_time_ = start_time;
-            ref_times_ = time_segments;
-            ref_waypoints_ = waypoints;
-            ref_bc_ = bc;
-            num_segments_ = static_cast<int>(ref_times_.size());
-            markLayoutDirty();
-
-            is_valid_ = checkValidity();
-            
-            if (is_valid_) {
-                if (internal_ws_)
-                    internal_ws_->resize(num_segments_);
-            }
-
-            return is_valid_;
+            OptimizationMask mask;
+            mask.time.assign(num_segments, static_cast<uint8_t>(1));
+            mask.waypoints.assign(num_segments + 1, static_cast<uint8_t>(1));
+            return mask;
         }
 
-        void setOptimizationFlags(const OptimizationFlags &flags)
+        const OptimizationMask &getActiveOptimizationMask(const OptimizationContext &ctx) const { return ctx.prepared.active_mask; }
+
+        void setRecordIntegralSamples(bool enable, OptimizationContext &ctx) const
         {
-            flags_ = flags;
-            markLayoutDirty();
+            ctx.runtime.buffers.record_integral_samples = enable;
         }
-        void setEnergyWeights(double rho_energy) { rho_energy_ = rho_energy; }
-        void setIntegralNumSteps(int steps) { integral_num_steps_ = steps; }
 
-        /**
-         * @brief Check if the current optimization state is valid.
-         * @return true if valid, false otherwise.
-         */
-        bool isValid() const { return is_valid_; }
-
-        /**
-         * @brief Convertible to bool to check validity.
-         */
-        operator bool() const { return is_valid_; }
+        const IntegralSampleBuffer &getRecordedIntegralSamples(const OptimizationContext &ctx) const
+        {
+            return ctx.runtime.buffers.integral_samples;
+        }
         
         /**
-         * @brief Get the last error message from validation checks.
-         * @return Error message string (empty if no error).
+         * @brief Re-run validation on an existing optimization context.
          */
-        std::string getLastError() const { return last_error_message_; }
-
-        /**
-         * @brief Perform a thorough validity check on segments, times, waypoints and BCs.
-         * Aggregates ALL errors instead of stopping at the first one.
-         * @param msg_out Optional output pointer to receive detailed error message.
-         * @return true if valid, false otherwise.
-         */
-        bool checkValidity(std::string* msg_out = nullptr) const
+        Status checkValidity(OptimizationContext &ctx) const
         {
-            std::vector<std::string> errors;
-            
-            if (num_segments_ <= 0) {
-                errors.push_back("Invalid segment count: num_segments_ <= 0");
-            }
-            
-            if (ref_times_.size() != static_cast<size_t>(num_segments_)) {
-                errors.push_back("Size mismatch: ref_times_.size() = " + std::to_string(ref_times_.size()) + 
-                                 " != num_segments_ = " + std::to_string(num_segments_));
-            }
-            
-            if (ref_waypoints_.rows() != num_segments_ + 1) {
-                errors.push_back("Size mismatch: ref_waypoints_.rows() = " + std::to_string(ref_waypoints_.rows()) + 
-                                 " != num_segments_ + 1 = " + std::to_string(num_segments_ + 1));
-            }
-            
-            if (!std::isfinite(start_time_)) {
-                errors.push_back("Start time is not finite (NaN or Inf)");
-            }
-            
-            for (size_t i = 0; i < ref_times_.size(); ++i) {
-                double t = ref_times_[i];
-                if (!std::isfinite(t)) {
-                    errors.push_back("Time segment [" + std::to_string(i) + "] is not finite: " + std::to_string(t));
-                } else if (t < MIN_VALID_DURATION) {
-                    errors.push_back("Time segment [" + std::to_string(i) + "] is too small: " + 
-                                     std::to_string(t) + " < " + std::to_string(MIN_VALID_DURATION));
-                }
-            }
-            
-            for (int i = 0; i < ref_waypoints_.rows(); ++i) {
-                if (!ref_waypoints_.row(i).array().isFinite().all()) {
-                    errors.push_back("Waypoint row [" + std::to_string(i) + "] contains NaN or Inf");
-                }
-            }
-            
-            if (!ref_bc_.start_velocity.array().isFinite().all()) {
-                errors.push_back("Start velocity contains NaN or Inf");
-            }
-            if (!ref_bc_.end_velocity.array().isFinite().all()) {
-                errors.push_back("End velocity contains NaN or Inf");
-            }
-            
-            if constexpr (SplineType::ORDER >= 5) {
-                if (!ref_bc_.start_acceleration.array().isFinite().all()) {
-                    errors.push_back("Start acceleration contains NaN or Inf");
-                }
-                if (!ref_bc_.end_acceleration.array().isFinite().all()) {
-                    errors.push_back("End acceleration contains NaN or Inf");
-                }
-            }
-            
-            if constexpr (SplineType::ORDER >= 7) {
-                if (!ref_bc_.start_jerk.array().isFinite().all()) {
-                    errors.push_back("Start jerk contains NaN or Inf");
-                }
-                if (!ref_bc_.end_jerk.array().isFinite().all()) {
-                    errors.push_back("End jerk contains NaN or Inf");
-                }
-            }
-            
-            if (!errors.empty()) {
-                reportError(msg_out, errors);
-                return false;
-            }
-            
-            if (msg_out) {
-                msg_out->clear();
-            }
-            
-            return true;
+            ctx.prepared.validation = validateConfiguration(ctx, true);
+            return ctx.prepared.validation;
         }
 
-        int getDimension() const { return calculateDimension(); }
+        int getDimension(const OptimizationContext &ctx) const { return calculateDimension(ctx); }
 
         /**
          * @brief Generate initial guess x based on reference state.
          * Applies 'toUnconstrained' mapping using unified layout logic.
          */
-        Eigen::VectorXd generateInitialGuess() const
+        Eigen::VectorXd generateInitialGuess(const OptimizationContext &ctx) const
         {
-            ensureLayoutCache();
-            int dim = total_dimension_;
-            Eigen::VectorXd x(dim);
-            for (int i = 0; i < num_segments_; ++i)
+            return encodeReferenceState(ctx);
+        }
+
+        Eigen::VectorXd encodeReferenceState(const OptimizationContext &ctx) const
+        {
+            const Eigen::VectorXd auxiliary_initial =
+                active_auxiliary_state_map_->getInitialValue(ctx.prepared.problem.time_segments,
+                                                             ctx.prepared.problem.waypoints,
+                                                             ctx.prepared.problem.start_time,
+                                                             ctx.prepared.problem.bc);
+            return encodeMaskedDecisionVariables(ctx,
+                                                 ctx.prepared.problem.time_segments,
+                                                 ctx.prepared.problem.waypoints,
+                                                 ctx.prepared.problem.bc,
+                                                 auxiliary_initial);
+        }
+
+        Status encodeWorkingState(const OptimizationContext &ctx, Eigen::VectorXd &x_out) const
+        {
+            const auto &state = ctx.runtime.state;
+            if (state.times.size() != ctx.prepared.problem.time_segments.size() ||
+                state.waypoints.rows() != ctx.prepared.problem.waypoints.rows())
             {
-                x(i) = active_time_map_->toTau(ref_times_[i]);
+                return makeErrorStatus(
+                    ErrorCode::InvalidOptimizerState,
+                    "[SplineOptimizer Error] OptimizationContext state is not initialized or does not match the prepared problem.");
             }
 
-            for (const auto &var : spatial_layout_)
+            Eigen::VectorXd auxiliary_vars = state.auxiliary_vars;
+            const int aux_dim = active_auxiliary_state_map_->getDimension();
+            if (aux_dim <= 0)
+            {
+                auxiliary_vars.resize(0);
+            }
+            else if (auxiliary_vars.size() != aux_dim)
+            {
+                return makeErrorStatus(
+                    ErrorCode::InvalidOptimizerState,
+                    "[SplineOptimizer Error] OptimizationContext auxiliary variable dimension does not match the active AuxiliaryStateMap.");
+            }
+
+            x_out = encodeMaskedDecisionVariables(ctx,
+                                                  ctx.runtime.state.times,
+                                                  ctx.runtime.state.waypoints,
+                                                  ctx.runtime.state.bc,
+                                                  auxiliary_vars);
+            return makeOkStatus();
+        }
+
+    private:
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        struct ResolvedEvaluateSpec
+        {
+            const TimeCostFunc &time_cost;
+            const IntegralCostFunc &integral_cost;
+            const WaypointsCostFunc &waypoints_cost;
+            const SampleCostFunc &sample_cost;
+            const TrajectoryCostFunc &trajectory_cost;
+            const Executor &executor;
+        };
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        ResolvedEvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                             WaypointsCostFunc, SampleCostFunc,
+                             TrajectoryCostFunc, Executor>
+        resolveEvaluateSpec(
+            const EvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                               WaypointsCostFunc, SampleCostFunc,
+                               TrajectoryCostFunc, Executor> &spec) const
+        {
+            return {
+                *spec.time_cost,
+                *spec.integral_cost,
+                resolveWaypointsCost(spec.waypoints_cost),
+                resolveSampleCost(spec.sample_cost),
+                resolveTrajectoryCost(spec.trajectory_cost),
+                spec.executor
+            };
+        }
+
+        Eigen::VectorXd encodeMaskedDecisionVariables(const OptimizationContext &ctx,
+                                                      const std::vector<double> &times,
+                                                      const WaypointsType &waypoints,
+                                                      const BoundaryConditions<DIM> &bc,
+                                                      const Eigen::VectorXd &auxiliary_vars) const
+        {
+            Eigen::VectorXd x = Eigen::VectorXd::Zero(ctx.prepared.layout.total_dimension);
+
+            for (const auto &var : ctx.prepared.layout.time)
+            {
+                x(var.offset) = active_time_map_->toTau(times[var.segment_index]);
+            }
+
+            for (const auto &var : ctx.prepared.layout.waypoints)
             {
                 x.segment(var.offset, var.dof) =
-                    active_spatial_map_->toUnconstrained(ref_waypoints_.row(var.point_index).transpose(), var.point_index);
+                    active_spatial_map_->toUnconstrained(waypoints.row(var.point_index).transpose(), var.point_index);
             }
 
-            BoundaryConditions<DIM> bc = ref_bc_;
-            int offset = derivatives_offset_;
-            auto apply_derivatives = [&](auto&& op) {
-                if (flags_.start_v) op(bc.start_velocity);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(bc.start_acceleration);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op(bc.start_jerk);
-                
-                if (flags_.end_v) op(bc.end_velocity);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op(bc.end_acceleration);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op(bc.end_jerk);
-            };
-
-            apply_derivatives([&](const VectorType& v) {
-                x.segment<DIM>(offset) = v;
+            int offset = ctx.prepared.layout.boundary_derivatives_offset;
+            forEachOptimizedBoundaryDerivativeSlot(ctx, [&](BoundaryDerivativeSlot slot) {
+                switch (slot)
+                {
+                    case BoundaryDerivativeSlot::StartV:
+                        x.template segment<DIM>(offset) = bc.start_velocity;
+                        break;
+                    case BoundaryDerivativeSlot::StartA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            x.template segment<DIM>(offset) = bc.start_acceleration;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::StartJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            x.template segment<DIM>(offset) = bc.start_jerk;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndV:
+                        x.template segment<DIM>(offset) = bc.end_velocity;
+                        break;
+                    case BoundaryDerivativeSlot::EndA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            x.template segment<DIM>(offset) = bc.end_acceleration;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            x.template segment<DIM>(offset) = bc.end_jerk;
+                        }
+                        break;
+                }
                 offset += DIM;
             });
 
             const int aux_dim = active_auxiliary_state_map_->getDimension();
             if (aux_dim > 0)
             {
-                x.segment(auxiliary_offset_, aux_dim) =
-                    active_auxiliary_state_map_->getInitialValue(ref_times_, ref_waypoints_, start_time_, ref_bc_);
+                assert(auxiliary_vars.size() == aux_dim &&
+                       "[SplineOptimizer Error] Auxiliary variable dimension mismatch during encoding.");
+                x.segment(ctx.prepared.layout.auxiliary_offset, aux_dim) = auxiliary_vars;
             }
 
             return x;
         }
 
-        /**
-         * @brief Primary evaluate: 4 cost functions with optional Workspace and Executor.
-         * @param ws Workspace pointer (default nullptr to use internal workspace).
-         * @param executor Executor instance (default SerialExecutor).
-         */
-        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
-                  typename TrajectoryCostFunc = VoidTrajectoryCost<SplineType, DIM>,
-                  typename Executor = SerialExecutor>
-        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
-                        TimeCostFunc &&time_cost_func,
-                        WaypointsCostFunc &&waypoints_cost_func,
-                        IntegralCostFunc &&integral_cost_func,
-                        TrajectoryCostFunc &&trajectory_cost_func,
-                        Workspace *ws = nullptr,
-                        const Executor& executor = Executor()) const
+        void decodeMaskedDecisionVariables(const OptimizationContext &ctx,
+                                          const Eigen::VectorXd &x,
+                                          WorkingState &state) const
         {
-            using TCF = typename std::decay<TimeCostFunc>::type;
-            using WCF = typename std::decay<WaypointsCostFunc>::type;
-            using SCF = typename std::decay<IntegralCostFunc>::type;
-            using TrCF = typename std::decay<TrajectoryCostFunc>::type;
-            constexpr bool kSupportsMatrixWaypointsCost =
-                TypeTraits::HasWaypointsCostInterface<WCF, WaypointsType>::value;
-
-            static_assert(TypeTraits::HasTimeCostInterface<TCF>::value,
-                          "\n[SplineOptimizer Error] 'TimeCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const vector<double>& Ts, VectorXd &grad)\n");
-
-            static_assert(kSupportsMatrixWaypointsCost,
-                          "\n[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const MatrixType& qs, MatrixXd &grad_q)\n");
-
-            static_assert(TypeTraits::HasIntegralCostInterface<SCF, VectorType>::value,
-                          "\n[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.\n");
-
-            static_assert(TypeTraits::HasTrajectoryCostInterface<TrCF, SplineType, DIM>::value,
-                          "\n[SplineOptimizer Error] 'TrajectoryCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const SplineType&, const vector<double>&,\n"
-                          "                                  const MatrixType&, double,\n"
-                          "                                  const BoundaryConditions<DIM>&,\n"
-                          "                                  SplineType::Gradients&)\n");
-
-            static_assert(TypeTraits::HasExecutorInterface<Executor>::value,
-                          "\n[SplineOptimizer Error] 'Executor' signature mismatch.\n"
-                          "The Executor must implement:\n"
-                          "  void operator()(int start, int end, Func&& f) const;\n"
-                          "where 'f' is a callable accepting an 'int' index.\n");
-            ensureLayoutCache();
-
-            Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
-            ws_ref.resize(num_segments_);
-            grad_out.setZero(x.size());
-            double total_cost = 0.0;
-            int n_inner = std::max(0, num_segments_ - 1);
-
-            for (int i = 0; i < num_segments_; ++i)
+            state.times = ctx.prepared.problem.time_segments;
+            for (const auto &var : ctx.prepared.layout.time)
             {
-                ws_ref.cache_times[i] = active_time_map_->toTime(x(i));
+                state.times[var.segment_index] = active_time_map_->toTime(x(var.offset));
             }
 
-            ws_ref.cache_waypoints = ref_waypoints_;
-            for (const auto &var : spatial_layout_)
+            state.waypoints = ctx.prepared.problem.waypoints;
+            for (const auto &var : ctx.prepared.layout.waypoints)
             {
-                ws_ref.cache_waypoints.row(var.point_index) =
+                state.waypoints.row(var.point_index) =
                     active_spatial_map_->toPhysical(x.segment(var.offset, var.dof), var.point_index).transpose();
             }
 
-            BoundaryConditions<DIM> current_bc = ref_bc_;
-            double current_start_time = start_time_;
-            int offset = derivatives_offset_;
-            auto apply_derivatives_forward = [&](auto&& op) {
+            state.bc = ctx.prepared.problem.bc;
+            state.start_time = ctx.prepared.problem.start_time;
 
-                if (flags_.start_v) op(current_bc.start_velocity);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(current_bc.start_acceleration);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op(current_bc.start_jerk);
-                
-                if (flags_.end_v) op(current_bc.end_velocity);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op(current_bc.end_acceleration);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op(current_bc.end_jerk);
-            };
-
-            apply_derivatives_forward([&](VectorType& target) {
-                target = x.template segment<DIM>(offset);
+            int offset = ctx.prepared.layout.boundary_derivatives_offset;
+            forEachOptimizedBoundaryDerivativeSlot(ctx, [&](BoundaryDerivativeSlot slot) {
+                switch (slot)
+                {
+                    case BoundaryDerivativeSlot::StartV:
+                        state.bc.start_velocity = x.template segment<DIM>(offset);
+                        break;
+                    case BoundaryDerivativeSlot::StartA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            state.bc.start_acceleration = x.template segment<DIM>(offset);
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::StartJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            state.bc.start_jerk = x.template segment<DIM>(offset);
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndV:
+                        state.bc.end_velocity = x.template segment<DIM>(offset);
+                        break;
+                    case BoundaryDerivativeSlot::EndA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            state.bc.end_acceleration = x.template segment<DIM>(offset);
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            state.bc.end_jerk = x.template segment<DIM>(offset);
+                        }
+                        break;
+                }
                 offset += DIM;
             });
+        }
 
-            const int aux_dim = active_auxiliary_state_map_->getDimension();
-            Eigen::VectorXd auxiliary_vars;
-            if (aux_dim > 0)
+        void applyAuxiliaryVariables(const OptimizationContext &ctx,
+                                     const Eigen::VectorXd &x,
+                                     WorkingState &state) const
+        {
+            const int auxiliary_dim = active_auxiliary_state_map_->getDimension();
+            if (auxiliary_dim > 0)
             {
-                auxiliary_vars = x.segment(auxiliary_offset_, aux_dim);
-                active_auxiliary_state_map_->apply(auxiliary_vars,
-                                                   ws_ref.cache_times,
-                                                   ws_ref.cache_waypoints,
-                                                   current_start_time,
-                                                   current_bc);
+                state.auxiliary_vars = x.segment(ctx.prepared.layout.auxiliary_offset, auxiliary_dim);
+                active_auxiliary_state_map_->apply(state.auxiliary_vars,
+                                                   state.times,
+                                                   state.waypoints,
+                                                   state.start_time,
+                                                   state.bc);
+            }
+            else
+            {
+                state.auxiliary_vars.resize(0);
+            }
+        }
+
+        void updateWorkingSpline(WorkingState &state) const
+        {
+            state.spline.update(state.times, state.waypoints, state.start_time, state.bc);
+        }
+
+        void decodeAndBuildWorkingState(const OptimizationContext &ctx,
+                                        const Eigen::VectorXd &x,
+                                        OptimizationContext &work_ctx) const
+        {
+            decodeMaskedDecisionVariables(ctx, x, work_ctx.runtime.state);
+            applyAuxiliaryVariables(ctx, x, work_ctx.runtime.state);
+            updateWorkingSpline(work_ctx.runtime.state);
+        }
+
+        void resetEvaluationState(Eigen::Index gradient_size,
+                                  Eigen::VectorXd &grad_out,
+                                  OptimizationContext &ctx) const
+        {
+            ctx.runtime.resize(ctx.prepared.num_segments);
+            grad_out.setZero(gradient_size);
+        }
+
+        template <typename TimeCostFunc>
+        double accumulateTimeCost(const TimeCostFunc &time_cost, OptimizationContext &ctx) const
+        {
+            auto &state = ctx.runtime.state;
+            auto &buffers = ctx.runtime.buffers;
+            buffers.time_cost_grad_buffer.setZero();
+            buffers.grad_times.setZero();
+
+            double total_cost = time_cost(state.times, buffers.time_cost_grad_buffer);
+            buffers.grad_times += buffers.time_cost_grad_buffer;
+            return total_cost;
+        }
+
+        template <typename IntegralCostFunc, typename SampleCostFunc, typename Executor>
+        double accumulateIntegralAndSampleCosts(const IntegralCostFunc &integral_cost,
+                                                const SampleCostFunc &sample_cost,
+                                                OptimizationContext &ctx,
+                                                const Executor &executor) const
+        {
+            using SampleCost = typename std::decay<SampleCostFunc>::type;
+            auto &state = ctx.runtime.state;
+            auto &buffers = ctx.runtime.buffers;
+
+            double total_cost = 0.0;
+            buffers.grad_coeffs.setZero();
+
+            const bool need_integral_samples =
+                buffers.record_integral_samples || !std::is_same_v<SampleCost, VoidSampleCost>;
+            accumulateIntegralCost(ctx, buffers.grad_coeffs, buffers.grad_times, total_cost,
+                                   integral_cost,
+                                   state.start_time,
+                                   need_integral_samples,
+                                   executor);
+
+            if constexpr (!std::is_same_v<SampleCost, VoidSampleCost>)
+            {
+                const Eigen::Index sample_count =
+                    static_cast<Eigen::Index>(buffers.integral_samples.size());
+
+                buffers.sample_position_grad_buffer.resize(DIM, sample_count);
+                buffers.sample_position_grad_buffer.setZero();
+                buffers.sample_time_grad_buffer.resize(sample_count);
+                buffers.sample_time_grad_buffer.setZero();
+
+                total_cost += sample_cost(buffers.integral_samples,
+                                          buffers.sample_position_grad_buffer,
+                                          buffers.sample_time_grad_buffer);
+
+                accumulateSampleCostGradients(buffers.integral_samples,
+                                              buffers.sample_position_grad_buffer,
+                                              buffers.sample_time_grad_buffer,
+                                              buffers.grad_coeffs,
+                                              buffers.grad_times,
+                                              ctx.prepared.num_segments);
             }
 
-            ws_ref.spline.update(ws_ref.cache_times, ws_ref.cache_waypoints, current_start_time, current_bc);
+            return total_cost;
+        }
 
-            ws_ref.user_gdT_buffer.setZero();
-            ws_ref.cache_gdT.setZero();
-            total_cost += time_cost_func(ws_ref.cache_times, ws_ref.user_gdT_buffer);
-            ws_ref.cache_gdT += ws_ref.user_gdT_buffer;
+        template <typename TrajectoryCostFunc>
+        double accumulateTrajectoryCost(const TrajectoryCostFunc &trajectory_cost, OptimizationContext &ctx) const
+        {
+            auto &state = ctx.runtime.state;
+            auto &buffers = ctx.runtime.buffers;
+            return trajectory_cost(state.spline,
+                                   state.times,
+                                   state.waypoints,
+                                   state.start_time,
+                                   state.bc,
+                                   buffers.grads);
+        }
 
-            ws_ref.cache_gdC.setZero();
-            calculateIntegralCost(ws_ref, ws_ref.cache_gdC, ws_ref.cache_gdT, total_cost, 
-                                  std::forward<IntegralCostFunc>(integral_cost_func),
-                                  current_start_time,
-                                  executor);
-
-            ws_ref.spline.propagateGrad(ws_ref.cache_gdC, ws_ref.cache_gdT, ws_ref.grads);
-
-            total_cost += trajectory_cost_func(ws_ref.spline,
-                                               ws_ref.cache_times,
-                                               ws_ref.cache_waypoints,
-                                               current_start_time,
-                                               current_bc,
-                                               ws_ref.grads);
-
-            if constexpr (!std::is_same_v<WCF, VoidWaypointsCost>)
+        template <typename WaypointsCostFunc>
+        double accumulateWaypointCost(const OptimizationContext &ctx,
+                                     const WaypointsCostFunc &waypoints_cost,
+                                     OptimizationContext &work_ctx) const
+        {
+            using WaypointsCost = typename std::decay<WaypointsCostFunc>::type;
+            auto &state = work_ctx.runtime.state;
+            auto &buffers = work_ctx.runtime.buffers;
+            if constexpr (std::is_same_v<WaypointsCost, VoidWaypointsCost>)
             {
-                ws_ref.discrete_grad_q_buffer.setZero();
-
-                double dw_cost = waypoints_cost_func(ws_ref.cache_waypoints, ws_ref.discrete_grad_q_buffer);
-                total_cost += dw_cost;
-
-                ws_ref.grads.start.p += ws_ref.discrete_grad_q_buffer.row(0).transpose();
-                if (n_inner > 0) {
-                    ws_ref.grads.inner_points += ws_ref.discrete_grad_q_buffer.block(1, 0, n_inner, DIM);
-                }
-                ws_ref.grads.end.p += ws_ref.discrete_grad_q_buffer.row(num_segments_).transpose();
+                return 0.0;
             }
-
-            if (rho_energy_ > 0)
+            else
             {
-                double energy = ws_ref.spline.getEnergy();
-                total_cost += rho_energy_ * energy;
+                const int num_inner_points = std::max(0, ctx.prepared.num_segments - 1);
 
-                ws_ref.spline.getEnergyGrad(ws_ref.energy_grads);
+                buffers.waypoint_grad_buffer.setZero();
+                const double waypoint_cost_value =
+                    waypoints_cost(state.waypoints, buffers.waypoint_grad_buffer);
 
-                ws_ref.grads.times += rho_energy_ * ws_ref.energy_grads.times;
-                if (n_inner > 0)
-                    ws_ref.grads.inner_points += rho_energy_ * ws_ref.energy_grads.inner_points;
-
-                ws_ref.grads.start.p += rho_energy_ * ws_ref.energy_grads.start.p;
-                ws_ref.grads.start.v += rho_energy_ * ws_ref.energy_grads.start.v;
-                if constexpr (SplineType::ORDER >= 5) ws_ref.grads.start.a += rho_energy_ * ws_ref.energy_grads.start.a;
-                if constexpr (SplineType::ORDER >= 7) ws_ref.grads.start.j += rho_energy_ * ws_ref.energy_grads.start.j;
-
-                ws_ref.grads.end.p += rho_energy_ * ws_ref.energy_grads.end.p;
-                ws_ref.grads.end.v += rho_energy_ * ws_ref.energy_grads.end.v;
-                if constexpr (SplineType::ORDER >= 5) ws_ref.grads.end.a += rho_energy_ * ws_ref.energy_grads.end.a;
-                if constexpr (SplineType::ORDER >= 7) ws_ref.grads.end.j += rho_energy_ * ws_ref.energy_grads.end.j;
-            }
-
-            if (aux_dim > 0)
-            {
-                Eigen::VectorXd auxiliary_grad;
-                total_cost += active_auxiliary_state_map_->backward(auxiliary_vars,
-                                                                    ws_ref.spline,
-                                                                    ws_ref.cache_times,
-                                                                    ws_ref.cache_waypoints,
-                                                                    current_start_time,
-                                                                    current_bc,
-                                                                    ws_ref.grads,
-                                                                    auxiliary_grad);
-                if (auxiliary_grad.size() != aux_dim)
+                buffers.grads.start.p += buffers.waypoint_grad_buffer.row(0).transpose();
+                if (num_inner_points > 0)
                 {
-                    auxiliary_grad.conservativeResize(aux_dim);
-                    auxiliary_grad.setZero();
+                    buffers.grads.inner_points += buffers.waypoint_grad_buffer.block(1, 0, num_inner_points, DIM);
                 }
-                grad_out.segment(auxiliary_offset_, aux_dim) = auxiliary_grad;
-            }
+                buffers.grads.end.p += buffers.waypoint_grad_buffer.row(ctx.prepared.num_segments).transpose();
 
-            // Time gradient: backward through time map
-            for (int i = 0; i < num_segments_; ++i)
+                return waypoint_cost_value;
+            }
+        }
+
+        double accumulateEnergyCost(const OptimizationContext &ctx, OptimizationContext &work_ctx) const
+        {
+            auto &state = work_ctx.runtime.state;
+            auto &buffers = work_ctx.runtime.buffers;
+            if (rho_energy_ <= 0.0)
             {
-                double tau = x(i);
-                double T = ws_ref.cache_times[i];
-                double gradT = ws_ref.grads.times(i);
-                grad_out(i) = active_time_map_->backward(tau, T, gradT);
+                return 0.0;
             }
 
-            // Spatial gradient: unified loop with backward mapping
-            for (const auto &var : spatial_layout_)
+            const int num_inner_points = std::max(0, ctx.prepared.num_segments - 1);
+            const double energy = state.spline.getEnergy();
+            state.spline.getEnergyGrad(buffers.energy_grads);
+
+            buffers.grads.times += rho_energy_ * buffers.energy_grads.times;
+            if (num_inner_points > 0)
+            {
+                buffers.grads.inner_points += rho_energy_ * buffers.energy_grads.inner_points;
+            }
+
+            buffers.grads.start.p += rho_energy_ * buffers.energy_grads.start.p;
+            buffers.grads.start.v += rho_energy_ * buffers.energy_grads.start.v;
+            if constexpr (SplineType::ORDER >= 5) buffers.grads.start.a += rho_energy_ * buffers.energy_grads.start.a;
+            if constexpr (SplineType::ORDER >= 7) buffers.grads.start.j += rho_energy_ * buffers.energy_grads.start.j;
+
+            buffers.grads.end.p += rho_energy_ * buffers.energy_grads.end.p;
+            buffers.grads.end.v += rho_energy_ * buffers.energy_grads.end.v;
+            if constexpr (SplineType::ORDER >= 5) buffers.grads.end.a += rho_energy_ * buffers.energy_grads.end.a;
+            if constexpr (SplineType::ORDER >= 7) buffers.grads.end.j += rho_energy_ * buffers.energy_grads.end.j;
+
+            return rho_energy_ * energy;
+        }
+
+        double backpropagateAuxiliaryGradient(const OptimizationContext &ctx,
+                                             Eigen::VectorXd &grad_out,
+                                             OptimizationContext &work_ctx) const
+        {
+            const int auxiliary_dim = active_auxiliary_state_map_->getDimension();
+            if (auxiliary_dim <= 0)
+            {
+                return 0.0;
+            }
+
+            auto &state = work_ctx.runtime.state;
+            auto &buffers = work_ctx.runtime.buffers;
+            Eigen::VectorXd grad_aux;
+            const double auxiliary_cost = active_auxiliary_state_map_->backward(state.auxiliary_vars,
+                                                                                state.spline,
+                                                                                state.times,
+                                                                                state.waypoints,
+                                                                                state.start_time,
+                                                                                state.bc,
+                                                                                buffers.grads,
+                                                                                grad_aux);
+            if (grad_aux.size() != auxiliary_dim)
+            {
+                assert(false && "[SplineOptimizer Error] Auxiliary gradient dimension mismatch.");
+                grad_aux.conservativeResize(auxiliary_dim);
+                grad_aux.setZero();
+            }
+            grad_out.segment(ctx.prepared.layout.auxiliary_offset, auxiliary_dim) = grad_aux;
+            return auxiliary_cost;
+        }
+
+        void propagateSplineGradients(OptimizationContext &work_ctx) const
+        {
+            work_ctx.runtime.state.spline.propagateGrad(work_ctx.runtime.buffers.grad_coeffs,
+                                                        work_ctx.runtime.buffers.grad_times,
+                                                        work_ctx.runtime.buffers.grads);
+        }
+
+        void writeDecisionGradient(const Eigen::VectorXd &x,
+                                   Eigen::VectorXd &grad_out,
+                                   const OptimizationContext &ctx) const
+        {
+            const auto &state = ctx.runtime.state;
+            const auto &buffers = ctx.runtime.buffers;
+
+            for (const auto &var : ctx.prepared.layout.time)
+            {
+                const double tau = x(var.offset);
+                const double T = state.times[var.segment_index];
+                const double gradT = buffers.grads.times(var.segment_index);
+                grad_out(var.offset) = active_time_map_->backward(tau, T, gradT);
+            }
+
+            for (const auto &var : ctx.prepared.layout.waypoints)
             {
                 const auto xi = x.segment(var.offset, var.dof);
 
                 if (var.point_index == 0)
                 {
                     grad_out.segment(var.offset, var.dof) =
-                        active_spatial_map_->backwardGrad(xi, ws_ref.grads.start.p, 0);
+                        active_spatial_map_->backwardGrad(xi, buffers.grads.start.p, 0);
                 }
-                else if (var.point_index == num_segments_)
+                else if (var.point_index == ctx.prepared.num_segments)
                 {
                     grad_out.segment(var.offset, var.dof) =
-                        active_spatial_map_->backwardGrad(xi, ws_ref.grads.end.p, var.point_index);
+                        active_spatial_map_->backwardGrad(xi, buffers.grads.end.p, var.point_index);
                 }
                 else
                 {
-                    VectorType inner_grad = ws_ref.grads.inner_points.row(var.point_index - 1).transpose();
+                    VectorType grad_inner_point = buffers.grads.inner_points.row(var.point_index - 1).transpose();
                     grad_out.segment(var.offset, var.dof) =
-                        active_spatial_map_->backwardGrad(xi, inner_grad, var.point_index);
+                        active_spatial_map_->backwardGrad(xi, grad_inner_point, var.point_index);
                 }
             }
 
-            offset = derivatives_offset_;
-            auto apply_derivatives_backward = [&](auto&& op) {
-                if (flags_.start_v) op(ws_ref.grads.start.v);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(ws_ref.grads.start.a);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op(ws_ref.grads.start.j);
-                
-                if (flags_.end_v) op(ws_ref.grads.end.v);
-                if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op(ws_ref.grads.end.a);
-                if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op(ws_ref.grads.end.j);
-            };
-
-            apply_derivatives_backward([&](const VectorType& g) {
-                grad_out.template segment<DIM>(offset) = g;
+            int offset = ctx.prepared.layout.boundary_derivatives_offset;
+            forEachOptimizedBoundaryDerivativeSlot(ctx, [&](BoundaryDerivativeSlot slot) {
+                switch (slot)
+                {
+                    case BoundaryDerivativeSlot::StartV:
+                        grad_out.template segment<DIM>(offset) = buffers.grads.start.v;
+                        break;
+                    case BoundaryDerivativeSlot::StartA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            grad_out.template segment<DIM>(offset) = buffers.grads.start.a;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::StartJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            grad_out.template segment<DIM>(offset) = buffers.grads.start.j;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndV:
+                        grad_out.template segment<DIM>(offset) = buffers.grads.end.v;
+                        break;
+                    case BoundaryDerivativeSlot::EndA:
+                        if constexpr (SplineType::ORDER >= 5)
+                        {
+                            grad_out.template segment<DIM>(offset) = buffers.grads.end.a;
+                        }
+                        break;
+                    case BoundaryDerivativeSlot::EndJ:
+                        if constexpr (SplineType::ORDER >= 7)
+                        {
+                            grad_out.template segment<DIM>(offset) = buffers.grads.end.j;
+                        }
+                        break;
+                }
                 offset += DIM;
             });
+        }
 
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename SampleCostFunc,
+                  typename Executor>
+        double accumulateForwardCosts(const TimeCostFunc &time_cost,
+                                      const IntegralCostFunc &integral_cost,
+                                      const SampleCostFunc &sample_cost,
+                                      OptimizationContext &ctx,
+                                      const Executor &executor) const
+        {
+            double total_cost = 0.0;
+            total_cost += accumulateTimeCost(time_cost, ctx);
+            total_cost += accumulateIntegralAndSampleCosts(integral_cost, sample_cost, ctx, executor);
             return total_cost;
         }
 
-        /**
-         * @brief Secondary evaluate: 3 cost functions without discrete waypoints cost.
-         * Forwards to primary evaluate with VoidWaypointsCost.
-         */
-        template <typename TimeCostFunc, typename IntegralCostFunc,
-                  typename TrajectoryCostFunc = VoidTrajectoryCost<SplineType, DIM>,
-                  typename Executor = SerialExecutor>
-        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
-                        TimeCostFunc &&time_cost_func, 
-                        IntegralCostFunc &&integral_cost_func,
-                        TrajectoryCostFunc &&trajectory_cost_func,
-                        Workspace *ws = nullptr,
-                        const Executor& executor = Executor()) const
+        template <typename WaypointsCostFunc,
+                  typename TrajectoryCostFunc>
+        double accumulatePostPropagationCosts(const OptimizationContext &ctx,
+                                             const WaypointsCostFunc &waypoints_cost,
+                                             const TrajectoryCostFunc &trajectory_cost,
+                                             Eigen::VectorXd &grad_out,
+                                             OptimizationContext &work_ctx) const
         {
-            return evaluate(x, grad_out,
-                            std::forward<TimeCostFunc>(time_cost_func),
-                            VoidWaypointsCost(), 
-                            std::forward<IntegralCostFunc>(integral_cost_func),
-                            std::forward<TrajectoryCostFunc>(trajectory_cost_func),
-                            ws, executor);
+            double total_cost = 0.0;
+            total_cost += accumulateTrajectoryCost(trajectory_cost, work_ctx);
+            total_cost += accumulateWaypointCost(ctx, waypoints_cost, work_ctx);
+            total_cost += accumulateEnergyCost(ctx, work_ctx);
+            total_cost += backpropagateAuxiliaryGradient(ctx, grad_out, work_ctx);
+            return total_cost;
+        }
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        double runEvaluation(
+            OptimizationContext &ctx,
+            const Eigen::VectorXd &x,
+            Eigen::VectorXd &grad_out,
+            const ResolvedEvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                                       WaypointsCostFunc, SampleCostFunc,
+                                       TrajectoryCostFunc, Executor> &spec) const
+        {
+            using TimeCost = typename std::decay<TimeCostFunc>::type;
+            using IntegralCost = typename std::decay<IntegralCostFunc>::type;
+            using WaypointsCost = typename std::decay<WaypointsCostFunc>::type;
+            using SampleCost = typename std::decay<SampleCostFunc>::type;
+            using TrajectoryCost = typename std::decay<TrajectoryCostFunc>::type;
+
+            static_assert(TypeTraits::HasTimeCostInterface<TimeCost>::value,
+                          "[SplineOptimizer Error] 'TimeCostFunc' signature mismatch.");
+            static_assert(TypeTraits::HasWaypointsCostInterface<WaypointsCost, WaypointsType>::value,
+                          "[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.");
+            static_assert(TypeTraits::HasIntegralCostInterface<IntegralCost, VectorType>::value,
+                          "[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.");
+            static_assert(TypeTraits::HasSampleCostInterface<SampleCost, IntegralSampleBuffer, SampleGradMatrix>::value,
+                          "[SplineOptimizer Error] 'SampleCostFunc' signature mismatch.");
+            static_assert(TypeTraits::HasTrajectoryCostInterface<TrajectoryCost, SplineType, DIM>::value,
+                          "[SplineOptimizer Error] 'TrajectoryCostFunc' signature mismatch.");
+            static_assert(TypeTraits::HasExecutorInterface<Executor>::value,
+                          "[SplineOptimizer Error] 'Executor' signature mismatch.");
+
+            resetEvaluationState(x.size(), grad_out, ctx);
+            decodeAndBuildWorkingState(ctx, x, ctx);
+
+            double total_cost =
+                accumulateForwardCosts(spec.time_cost, spec.integral_cost, spec.sample_cost, ctx, spec.executor);
+
+            propagateSplineGradients(ctx);
+            total_cost += accumulatePostPropagationCosts(ctx, spec.waypoints_cost, spec.trajectory_cost, grad_out, ctx);
+
+            writeDecisionGradient(x, grad_out, ctx);
+            return total_cost;
+        }
+
+    public:
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        EvaluationResult evaluate(
+            OptimizationContext &ctx,
+            const Eigen::VectorXd &x,
+            Eigen::VectorXd &grad_out,
+            const EvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                               WaypointsCostFunc, SampleCostFunc,
+                               TrajectoryCostFunc, Executor> &spec) const
+        {
+            const Status status = validateEvaluateSpec(ctx, x, spec);
+            if (!status)
+            {
+                grad_out.setZero(x.size());
+                return makeErrorEvaluationResult(status.code, status.message);
+            }
+            return makeOkEvaluationResult(runEvaluation(ctx, x, grad_out, resolveEvaluateSpec(spec)));
         }
 
         /**
-         * @brief Backward-compatible evaluate overload with no whole-spline cost.
+         * @brief Access the spline stored in a caller-provided optimization context.
          */
-        template <typename TimeCostFunc, typename IntegralCostFunc, typename Executor = SerialExecutor>
-        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
-                        TimeCostFunc &&time_cost_func,
-                        IntegralCostFunc &&integral_cost_func,
-                        Workspace *ws,
-                        const Executor& executor = Executor()) const
+        const SplineType &getWorkingSpline(const OptimizationContext &ctx) const
         {
-            return evaluate(x, grad_out,
-                            std::forward<TimeCostFunc>(time_cost_func),
-                            std::forward<IntegralCostFunc>(integral_cost_func),
-                            VoidTrajectoryCost<SplineType, DIM>(),
-                            ws,
-                            executor);
-        }
-
-        const SplineType *getOptimalSpline() const
-        {
-            if (internal_ws_)
-                return &(internal_ws_->spline);
-            return nullptr;
+            return ctx.runtime.state.spline;
         }
 
         struct GradientCheckResult
         {
             bool valid = false;          
+            ErrorCode code = ErrorCode::None;
             double error_norm = 0.0;      
             double rel_error = 0.0;       
+            double max_abs_error = 0.0;
+            Eigen::Index max_error_index = -1;
             Eigen::VectorXd analytical;   
             Eigen::VectorXd numerical;   
+            std::string message;
             
             std::string makeReport() const {
                 std::stringstream ss;
-                if (valid) 
-                    ss << "Gradient Check PASSED! Norm: " << error_norm << "\n";
-                else
-                    ss << "Gradient Check FAILED! Norm: " << error_norm << "\n";
+                ss << (valid ? "Gradient Check PASSED! " : "Gradient Check FAILED! ");
+                ss << "Norm: " << error_norm;
+                ss << ", MaxAbs: " << max_abs_error;
+                if (max_error_index >= 0)
+                {
+                    ss << ", Index: " << max_error_index;
+                }
+                if (!message.empty())
+                {
+                    ss << "\n" << message;
+                }
+                ss << "\n";
                 return ss.str();
             }
         };
 
-        /**
-         * @brief Primary checkGradients: 3 cost functions with optional Workspace.
-         * @param ws Workspace pointer (default nullptr to use internal workspace).
-         */
-        template <typename TFunc, typename WFunc, typename IFunc>
-        GradientCheckResult checkGradients(const Eigen::VectorXd &x, 
-                            TFunc &&tf, WFunc &&wf, IFunc &&ifc, 
-                            Workspace *ws = nullptr,
-                            double eps = 1e-6,
-                            double tol = 1e-4)
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        GradientCheckResult checkGradients(
+            OptimizationContext &ctx,
+            const Eigen::VectorXd &x,
+            const EvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                               WaypointsCostFunc, SampleCostFunc,
+                               TrajectoryCostFunc, Executor> &spec,
+            double eps = 1e-6,
+            double tol = 1e-4)
         {
             GradientCheckResult res;
-            
-            Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
-            
+            const Status status = validateEvaluateSpec(ctx, x, spec);
+            if (!status)
+            {
+                res.code = status.code;
+                res.message = status.message;
+                return res;
+            }
+            auto resolved_spec = resolveEvaluateSpec(spec);
+
             res.analytical.resize(x.size());
-            evaluate(x, res.analytical, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
+            runEvaluation(ctx, x, res.analytical, resolved_spec);
 
             res.numerical.resize(x.size());
-            Eigen::VectorXd dummy_grad(x.size());
-
-            Eigen::VectorXd x_temp = x;
-
-            for (int i = 0; i < x.size(); ++i)
-            {
-                double old_val = x_temp(i);
-                
-                x_temp(i) = old_val + eps;
-                double c_p = evaluate(x_temp, dummy_grad, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
-                
-                x_temp(i) = old_val - eps;
-                double c_m = evaluate(x_temp, dummy_grad, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
-                
-                x_temp(i) = old_val;
-
-                res.numerical(i) = (c_p - c_m) / (2 * eps);
-            }
-
-            evaluate(x, res.analytical, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
+            computeNumericalGradient(ctx, x, eps, resolved_spec, res.numerical);
 
             Eigen::VectorXd diff = res.analytical - res.numerical;
             res.error_norm = diff.norm();
+            if (diff.size() > 0)
+            {
+                Eigen::Index idx = 0;
+                res.max_abs_error = diff.cwiseAbs().maxCoeff(&idx);
+                res.max_error_index = idx;
+            }
 
             double grad_norm = res.analytical.norm();
             res.rel_error = (grad_norm > 1e-9) ? (res.error_norm / grad_norm) : res.error_norm;
@@ -1384,88 +1578,449 @@ namespace SplineTrajectory
             return res;
         }
 
-        /**
-         * @brief Secondary checkGradients: 2 cost functions (no waypoints cost).
-         * Forwards to primary checkGradients with VoidWaypointsCost.
-         */
-        template <typename TFunc, typename IFunc>
-        GradientCheckResult checkGradients(const Eigen::VectorXd &x, 
-                            TFunc &&tf, IFunc &&ifc, 
-                            Workspace *ws = nullptr,
-                            double eps = 1e-6,
-                            double tol = 1e-4)
-        {
-            return checkGradients(x, 
-                                  std::forward<TFunc>(tf), 
-                                  VoidWaypointsCost(),
-                                  std::forward<IFunc>(ifc), 
-                                  ws,
-                                  eps,
-                                  tol);
-        }
-
 
     private:
-        /**
-         * @brief Helper to safely format and report error messages.
-         * Aggregates multiple error strings into a single message.
-         * @param out Optional output pointer to store error message
-         * @param errors Vector of individual error messages
-         */
-        void reportError(std::string* out, const std::vector<std::string>& errors) const
+        static Status makeOkStatus()
         {
-            if (errors.empty()) return;
-            
+            Status status;
+            status.ok = true;
+            status.code = ErrorCode::None;
+            return status;
+        }
+
+        static Status makeErrorStatus(ErrorCode code, std::string message)
+        {
+            Status status;
+            status.ok = false;
+            status.code = code;
+            status.message = std::move(message);
+            return status;
+        }
+
+        static EvaluationResult makeOkEvaluationResult(double cost)
+        {
+            EvaluationResult result;
+            result.ok = true;
+            result.code = ErrorCode::None;
+            result.cost = cost;
+            return result;
+        }
+
+        static EvaluationResult makeErrorEvaluationResult(ErrorCode code, std::string message)
+        {
+            EvaluationResult result;
+            result.ok = false;
+            result.code = code;
+            result.message = std::move(message);
+            return result;
+        }
+
+        static Status makeValidationStatus(const std::vector<std::string> &errors)
+        {
+            if (errors.empty())
+            {
+                return makeOkStatus();
+            }
+
             std::stringstream ss;
             ss << "[SplineOptimizer Validation Failed] Found " << errors.size() << " error(s):\n";
-            for (size_t i = 0; i < errors.size(); ++i) {
+            for (size_t i = 0; i < errors.size(); ++i)
+            {
                 ss << "  [" << (i + 1) << "] " << errors[i] << "\n";
             }
-            
-            std::string msg = ss.str();
-            
-            last_error_message_ = msg;
-            
-            if (out) {
-                *out = msg;
+
+            return makeErrorStatus(ErrorCode::ValidationFailed, ss.str());
+        }
+
+        int calculateDimension(const OptimizationContext &ctx) const
+        {
+            return ctx.prepared.layout.total_dimension;
+        }
+
+        void appendMaskCapabilityErrors(const OptimizationContext &ctx, std::vector<std::string> &errors) const
+        {
+            if constexpr (SplineType::ORDER < 5)
+            {
+                if (ctx.prepared.active_mask.start.a || ctx.prepared.active_mask.end.a)
+                {
+                    errors.push_back("OptimizationMask requests acceleration optimization, "
+                                     "but this spline order does not expose acceleration boundary variables.");
+                }
+            }
+
+            if constexpr (SplineType::ORDER < 7)
+            {
+                if (ctx.prepared.active_mask.start.j || ctx.prepared.active_mask.end.j)
+                {
+                    errors.push_back("OptimizationMask requests jerk optimization, "
+                                     "but this spline order does not expose jerk boundary variables.");
+                }
             }
         }
-        
-        int calculateDimension() const
+
+        void appendValidationErrors(const OptimizationContext &ctx,
+                                    std::vector<std::string> &errors,
+                                    bool require_initialized_state) const
         {
-            ensureLayoutCache();
-            return total_dimension_;
+            appendMaskCapabilityErrors(ctx, errors);
+
+            if (require_initialized_state)
+            {
+                if (ctx.prepared.num_segments <= 0)
+                {
+                    errors.push_back("Invalid segment count: num_segments <= 0");
+                }
+
+                if (ctx.prepared.problem.time_segments.size() != static_cast<size_t>(ctx.prepared.num_segments))
+                {
+                    errors.push_back("Size mismatch: problem.time_segments.size() = " +
+                                     std::to_string(ctx.prepared.problem.time_segments.size()) +
+                                     " != num_segments = " + std::to_string(ctx.prepared.num_segments));
+                }
+
+                if (ctx.prepared.problem.waypoints.rows() != ctx.prepared.num_segments + 1)
+                {
+                    errors.push_back("Size mismatch: problem.waypoints.rows() = " +
+                                     std::to_string(ctx.prepared.problem.waypoints.rows()) +
+                                     " != num_segments + 1 = " + std::to_string(ctx.prepared.num_segments + 1));
+                }
+
+                if (!std::isfinite(ctx.prepared.problem.start_time))
+                {
+                    errors.push_back("Start time is not finite (NaN or Inf)");
+                }
+            }
+
+            if (ctx.prepared.num_segments > 0)
+            {
+                if (!ctx.prepared.active_mask.time.empty() &&
+                    ctx.prepared.active_mask.time.size() != static_cast<size_t>(ctx.prepared.num_segments))
+                {
+                    errors.push_back("OptimizationMask.time size mismatch: " +
+                                     std::to_string(ctx.prepared.active_mask.time.size()) +
+                                     " != num_segments = " + std::to_string(ctx.prepared.num_segments));
+                }
+
+                if (!ctx.prepared.active_mask.waypoints.empty() &&
+                    ctx.prepared.active_mask.waypoints.size() != static_cast<size_t>(ctx.prepared.num_segments + 1))
+                {
+                    errors.push_back("OptimizationMask.waypoints size mismatch: " +
+                                     std::to_string(ctx.prepared.active_mask.waypoints.size()) +
+                                     " != num_segments + 1 = " + std::to_string(ctx.prepared.num_segments + 1));
+                }
+            }
+            else if (!ctx.prepared.active_mask.time.empty())
+            {
+                errors.push_back("OptimizationMask.time can only be sized after prepareContext() establishes segment count.");
+            }
+            else if (!ctx.prepared.active_mask.waypoints.empty())
+            {
+                errors.push_back("OptimizationMask.waypoints can only be sized after prepareContext() establishes segment count.");
+            }
+
+            if (require_initialized_state)
+            {
+                for (size_t i = 0; i < ctx.prepared.problem.time_segments.size(); ++i)
+                {
+                    double t = ctx.prepared.problem.time_segments[i];
+                    if (!std::isfinite(t))
+                    {
+                        errors.push_back("Time segment [" + std::to_string(i) + "] is not finite: " + std::to_string(t));
+                    }
+                    else if (t < MIN_VALID_DURATION)
+                    {
+                        errors.push_back("Time segment [" + std::to_string(i) + "] is too small: " +
+                                         std::to_string(t) + " < " + std::to_string(MIN_VALID_DURATION));
+                    }
+                }
+
+                for (int i = 0; i < ctx.prepared.problem.waypoints.rows(); ++i)
+                {
+                    if (!ctx.prepared.problem.waypoints.row(i).array().isFinite().all())
+                    {
+                        errors.push_back("Waypoint row [" + std::to_string(i) + "] contains NaN or Inf");
+                    }
+                }
+
+                if (!ctx.prepared.problem.bc.start_velocity.array().isFinite().all())
+                {
+                    errors.push_back("Start velocity contains NaN or Inf");
+                }
+                if (!ctx.prepared.problem.bc.end_velocity.array().isFinite().all())
+                {
+                    errors.push_back("End velocity contains NaN or Inf");
+                }
+
+                if constexpr (SplineType::ORDER >= 5)
+                {
+                    if (!ctx.prepared.problem.bc.start_acceleration.array().isFinite().all())
+                    {
+                        errors.push_back("Start acceleration contains NaN or Inf");
+                    }
+                    if (!ctx.prepared.problem.bc.end_acceleration.array().isFinite().all())
+                    {
+                        errors.push_back("End acceleration contains NaN or Inf");
+                    }
+                }
+
+                if constexpr (SplineType::ORDER >= 7)
+                {
+                    if (!ctx.prepared.problem.bc.start_jerk.array().isFinite().all())
+                    {
+                        errors.push_back("Start jerk contains NaN or Inf");
+                    }
+                    if (!ctx.prepared.problem.bc.end_jerk.array().isFinite().all())
+                    {
+                        errors.push_back("End jerk contains NaN or Inf");
+                    }
+                }
+            }
+        }
+
+        Status validateConfiguration(const OptimizationContext &ctx, bool require_initialized_state) const
+        {
+            std::vector<std::string> errors;
+            appendValidationErrors(ctx, errors, require_initialized_state);
+            if (!errors.empty())
+            {
+                return makeValidationStatus(errors);
+            }
+            return makeOkStatus();
+        }
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        void computeNumericalGradient(
+            OptimizationContext &ctx,
+            const Eigen::VectorXd &x,
+            double eps,
+            const ResolvedEvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                                       WaypointsCostFunc, SampleCostFunc,
+                                       TrajectoryCostFunc, Executor> &spec,
+            Eigen::VectorXd &numerical_gradient) const
+        {
+            numerical_gradient.resize(x.size());
+
+            Eigen::VectorXd dummy_grad(x.size());
+            Eigen::VectorXd x_perturbed = x;
+
+            for (int i = 0; i < x.size(); ++i)
+            {
+                const double original_value = x_perturbed(i);
+
+                x_perturbed(i) = original_value + eps;
+                const double cost_plus = runEvaluation(ctx, x_perturbed, dummy_grad, spec);
+
+                x_perturbed(i) = original_value - eps;
+                const double cost_minus = runEvaluation(ctx, x_perturbed, dummy_grad, spec);
+
+                x_perturbed(i) = original_value;
+                numerical_gradient(i) = (cost_plus - cost_minus) / (2 * eps);
+            }
+        }
+
+        template <typename WaypointsCostFunc>
+        const WaypointsCostFunc &resolveWaypointsCost(const WaypointsCostFunc *cost_ptr) const
+        {
+            if constexpr (std::is_same_v<WaypointsCostFunc, VoidWaypointsCost>)
+            {
+                if (cost_ptr == nullptr)
+                {
+                    static const VoidWaypointsCost default_cost{};
+                    return default_cost;
+                }
+            }
+            return *cost_ptr;
+        }
+
+        template <typename SampleCostFunc>
+        const SampleCostFunc &resolveSampleCost(const SampleCostFunc *cost_ptr) const
+        {
+            if constexpr (std::is_same_v<SampleCostFunc, VoidSampleCost>)
+            {
+                if (cost_ptr == nullptr)
+                {
+                    static const VoidSampleCost default_cost{};
+                    return default_cost;
+                }
+            }
+            return *cost_ptr;
+        }
+
+        template <typename TrajectoryCostFunc>
+        const TrajectoryCostFunc &resolveTrajectoryCost(const TrajectoryCostFunc *cost_ptr) const
+        {
+            if constexpr (std::is_same_v<TrajectoryCostFunc, VoidTrajectoryCost<SplineType, DIM>>)
+            {
+                if (cost_ptr == nullptr)
+                {
+                    static const VoidTrajectoryCost<SplineType, DIM> default_cost{};
+                    return default_cost;
+                }
+            }
+            return *cost_ptr;
+        }
+
+        template <typename TimeCostFunc,
+                  typename IntegralCostFunc,
+                  typename WaypointsCostFunc,
+                  typename SampleCostFunc,
+                  typename TrajectoryCostFunc,
+                  typename Executor>
+        Status validateEvaluateSpec(
+            OptimizationContext &ctx,
+            const Eigen::VectorXd &x,
+            const EvaluateSpec<TimeCostFunc, IntegralCostFunc,
+                               WaypointsCostFunc, SampleCostFunc,
+                               TrajectoryCostFunc, Executor> &spec) const
+        {
+            if (!ctx.prepared.validation.ok)
+            {
+                return makeErrorStatus(ErrorCode::InvalidOptimizerState,
+                                       "[SplineOptimizer Error] evaluate() called on an invalid optimization context.");
+            }
+            if (integral_num_steps_ <= 0)
+            {
+                return makeErrorStatus(ErrorCode::InvalidIntegralSteps,
+                                       "[SplineOptimizer Error] integral_num_steps must be positive.");
+            }
+            if (x.size() != getDimension(ctx))
+            {
+                return makeErrorStatus(ErrorCode::DimensionMismatch,
+                                       "[SplineOptimizer Error] Input dimension mismatch in evaluate().");
+            }
+            if (spec.time_cost == nullptr)
+            {
+                return makeErrorStatus(ErrorCode::NullTimeCost,
+                                       "[SplineOptimizer Error] 'time_cost' must not be null.");
+            }
+            if (spec.integral_cost == nullptr)
+            {
+                return makeErrorStatus(ErrorCode::NullIntegralCost,
+                                       "[SplineOptimizer Error] 'integral_cost' must not be null.");
+            }
+            if constexpr (!std::is_same_v<WaypointsCostFunc, VoidWaypointsCost>)
+            {
+                if (spec.waypoints_cost == nullptr)
+                {
+                    return makeErrorStatus(ErrorCode::NullWaypointsCost,
+                                           "[SplineOptimizer Error] 'waypoints_cost' must not be null.");
+                }
+            }
+            if constexpr (!std::is_same_v<SampleCostFunc, VoidSampleCost>)
+            {
+                if (spec.sample_cost == nullptr)
+                {
+                    return makeErrorStatus(ErrorCode::NullSampleCost,
+                                           "[SplineOptimizer Error] 'sample_cost' must not be null.");
+                }
+            }
+            if constexpr (!std::is_same_v<TrajectoryCostFunc, VoidTrajectoryCost<SplineType, DIM>>)
+            {
+                if (spec.trajectory_cost == nullptr)
+                {
+                    return makeErrorStatus(ErrorCode::NullTrajectoryCost,
+                                           "[SplineOptimizer Error] 'trajectory_cost' must not be null.");
+                }
+            }
+            return makeOkStatus();
+        }
+
+        void accumulateSampleCostGradients(const IntegralSampleBuffer &samples,
+                                           const SampleGradMatrix &sample_position_gradients,
+                                           const Eigen::VectorXd &sample_time_gradients,
+                                           MatrixType &grad_coeffs,
+                                           Eigen::VectorXd &grad_times,
+                                           int num_segments) const
+        {
+            const Eigen::Index sample_count = static_cast<Eigen::Index>(samples.size());
+            if (sample_count == 0)
+            {
+                return;
+            }
+
+            if (sample_position_gradients.rows() != DIM || sample_position_gradients.cols() != sample_count)
+            {
+                assert(false && "[SplineOptimizer Error] Sample position gradient shape mismatch.");
+                return;
+            }
+
+            Eigen::VectorXd global_time_grad = Eigen::VectorXd::Zero(num_segments);
+
+            for (Eigen::Index sample_idx = 0; sample_idx < sample_count; ++sample_idx)
+            {
+                const IntegralSample &sample = samples[sample_idx];
+                const int base_row = sample.seg_idx * SplineType::COEFF_NUM;
+                const VectorType grad_position = sample_position_gradients.col(sample_idx);
+
+                grad_coeffs.template block<SplineType::COEFF_NUM, DIM>(base_row, 0).noalias() +=
+                    sample.b_p.transpose() * grad_position.transpose();
+                grad_times(sample.seg_idx) += grad_position.dot(sample.v) * sample.alpha;
+
+                if (sample_idx < sample_time_gradients.size())
+                {
+                    const double grad_time = sample_time_gradients(sample_idx);
+                    grad_times(sample.seg_idx) += grad_time * sample.alpha;
+                    global_time_grad(sample.seg_idx) += grad_time;
+                }
+            }
+
+            double accumulator = 0.0;
+            for (int i = num_segments - 1; i > 0; --i)
+            {
+                accumulator += global_time_grad(i);
+                grad_times(i - 1) += accumulator;
+            }
         }
 
         template <typename IntegralFunc, typename Executor>
-        void calculateIntegralCost(Workspace &ws, MatrixType &gdC, Eigen::VectorXd &gdT, double &cost,
-                                   IntegralFunc &&integral_cost,
-                                   double start_time,
-                                   const Executor& executor) const
+        void accumulateIntegralCost(OptimizationContext &ctx,
+                                    MatrixType &grad_coeffs,
+                                    Eigen::VectorXd &grad_times,
+                                    double &cost,
+                                    IntegralFunc &&integral_cost,
+                                    double start_time,
+                                    bool record_samples,
+                                    const Executor& executor) const
         {
-            const auto &coeffs = ws.spline.getTrajectory().getCoefficients();
-            
+            auto &state = ctx.runtime.state;
+            auto &buffers = ctx.runtime.buffers;
+            const auto &coeffs = state.spline.getTrajectory().getCoefficients();
+
             double running_time = start_time;
-            for(int i = 0; i < num_segments_; ++i) {
-                ws.segment_start_times[i] = running_time;
-                running_time += ws.cache_times[i];
+            for(int i = 0; i < ctx.prepared.num_segments; ++i) {
+                buffers.segment_begin_times[i] = running_time;
+                running_time += state.times[i];
             }
 
-            std::fill(ws.segment_costs.begin(), ws.segment_costs.end(), 0.0);
+            std::fill(buffers.segment_cost_buffer.begin(), buffers.segment_cost_buffer.end(), 0.0);
 
-            ws.explicit_time_grad_buffer.setZero();
+            buffers.global_time_grad_buffer.setZero();
 
             int K = integral_num_steps_;
             double inv_K = 1.0 / K;
-            
-            executor(0, num_segments_, [&](int i) {
-                double T = ws.cache_times[i];
+
+            if (record_samples)
+            {
+                buffers.integral_samples.resize(ctx.prepared.num_segments * (K + 1));
+            }
+            else
+            {
+                buffers.integral_samples.clear();
+            }
+
+            executor(0, ctx.prepared.num_segments, [&](int i) {
+                double T = state.times[i];
                 double dt = T * inv_K;
                 int base_row = i * SplineType::COEFF_NUM;
-                
-                Eigen::Matrix<double, SplineType::COEFF_NUM, DIM> coeff_block = 
-                     coeffs.template block<SplineType::COEFF_NUM, DIM>(base_row, 0); 
-                
+
+                Eigen::Matrix<double, SplineType::COEFF_NUM, DIM> coeff_block =
+                     coeffs.template block<SplineType::COEFF_NUM, DIM>(base_row, 0);
+
                 double local_acc_cost = 0.0;
                 double local_acc_gdT = 0.0;
                 double local_acc_explicit_time_grad = 0.0;
@@ -1474,7 +2029,7 @@ namespace SplineTrajectory
                 local_acc_gdC.setZero();
 
                 Eigen::Matrix<double, 1, SplineType::COEFF_NUM> b_p, b_v, b_a, b_j, b_s, b_c;
-                double current_segment_start_time = ws.segment_start_times[i];
+                double current_segment_start_time = buffers.segment_begin_times[i];
 
                 for (int k = 0; k <= K; ++k)
                 {
@@ -1487,7 +2042,7 @@ namespace SplineTrajectory
                     double t_global = current_segment_start_time + t;
 
                     SplineType::computeBasisFunctions(t, b_p, b_v, b_a, b_j, b_s, b_c);
-                    
+
                     VectorType p, v, a, j, s, c;
                     p.transpose().noalias() = b_p * coeff_block;
                     v.transpose().noalias() = b_v * coeff_block;
@@ -1505,13 +2060,30 @@ namespace SplineTrajectory
 
                     double c_val = integral_cost(t, t_global, i, k, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
 
+                    if (record_samples)
+                    {
+                        const int sample_index = i * (K + 1) + k;
+                        IntegralSample &sample = buffers.integral_samples[sample_index];
+                        sample.seg_idx = i;
+                        sample.step_in_seg = k;
+                        sample.sample_buffer_index = sample_index;
+                        sample.alpha = alpha;
+                        sample.t_local = t;
+                        sample.t_global = t_global;
+                        sample.trap_weight = weight_trap;
+                        sample.dt = dt;
+                        sample.b_p = b_p;
+                        sample.p = p;
+                        sample.v = v;
+                    }
+
                     local_acc_cost += c_val * common_weight;
 
                     local_acc_gdC.noalias() += (
-                        b_p.transpose() * gp.transpose() + 
-                        b_v.transpose() * gv.transpose() + 
-                        b_a.transpose() * ga.transpose() + 
-                        b_j.transpose() * gj.transpose() + 
+                        b_p.transpose() * gp.transpose() +
+                        b_v.transpose() * gv.transpose() +
+                        b_a.transpose() * ga.transpose() +
+                        b_j.transpose() * gj.transpose() +
                         b_s.transpose() * gs.transpose()
                     ) * common_weight;
 
@@ -1524,23 +2096,23 @@ namespace SplineTrajectory
                     local_acc_explicit_time_grad += gt * common_weight;
                 }
 
-                ws.segment_costs[i] = local_acc_cost;
-                
-                gdT(i) += local_acc_gdT;
-                ws.explicit_time_grad_buffer(i) += local_acc_explicit_time_grad;
-                
-                gdC.template block(base_row, 0, SplineType::COEFF_NUM, DIM) += local_acc_gdC;
+                buffers.segment_cost_buffer[i] = local_acc_cost;
+
+                grad_times(i) += local_acc_gdT;
+                buffers.global_time_grad_buffer(i) += local_acc_explicit_time_grad;
+
+                grad_coeffs.template block(base_row, 0, SplineType::COEFF_NUM, DIM) += local_acc_gdC;
             });
 
-            for(int i = 0; i < num_segments_; ++i) {
-                cost += ws.segment_costs[i];
+            for(int i = 0; i < ctx.prepared.num_segments; ++i) {
+                cost += buffers.segment_cost_buffer[i];
             }
 
             double accumulator = 0.0;
-            for (int i = num_segments_ - 1; i > 0; --i)
+            for (int i = ctx.prepared.num_segments - 1; i > 0; --i)
             {
-                accumulator += ws.explicit_time_grad_buffer(i);
-                gdT(i - 1) += accumulator;
+                accumulator += buffers.global_time_grad_buffer(i);
+                grad_times(i - 1) += accumulator;
             }
         }
     };
